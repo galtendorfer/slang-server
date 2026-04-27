@@ -43,6 +43,35 @@
 namespace server {
 using namespace slang;
 
+namespace {
+
+const ast::Symbol* tryGetHierarchyInstantiationTypeDefinition(
+    const std::shared_ptr<SlangDoc>& doc, ServerCompilation* compilation,
+    SourceLocation loc) {
+    // When a build file is active, use the elaborated compilation to resolve
+    // module type names at instantiation sites. This avoids picking an
+    // unrelated duplicate definition from the workspace index.
+    if (!compilation) {
+        return nullptr;
+    }
+
+    for (auto inst : doc->getSyntaxTree()->getMetadata().globalInstances) {
+        if (!inst->type.range().contains(loc)) {
+            continue;
+        }
+
+        auto result = compilation->getCompilation().tryGetDefinition(
+            inst->type.valueText(), compilation->getCompilation().getRoot());
+        if (result.definition) {
+            return result.definition;
+        }
+    }
+
+    return nullptr;
+}
+
+} // namespace
+
 ServerDriver::ServerDriver(Indexer& indexer, SlangLspClient& client, const Config& config,
                            std::vector<std::string> buildfiles) :
     sm(driver.sourceManager), diagEngine(driver.diagEngine), client(client),
@@ -555,7 +584,13 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
         nameToken = macroDef->name;
     }
     else {
-        symbol = analysis->getSymbolAtToken(declTok);
+        // Prefer the active build compilation for instantiation type tokens.
+        // Shallow analysis can still see a symbol here, but in duplicate-name
+        // workspaces that symbol may come from the wrong file.
+        symbol = tryGetHierarchyInstantiationTypeDefinition(doc, comp.get(), loc.value());
+        if (!symbol) {
+            symbol = analysis->getSymbolAtToken(declTok);
+        }
         if (!symbol) {
             // check the index
             auto symbols = m_indexer.getFilesForSymbol(declTok->rawText());

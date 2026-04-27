@@ -4,6 +4,7 @@
 #include "lsp/LspTypes.h"
 #include "utils/ServerHarness.h"
 #include <cstdlib>
+#include <filesystem>
 
 TEST_CASE("SetBuildFile") {
     ServerHarness server("comp_repo");
@@ -108,6 +109,34 @@ TEST_CASE("CompilationGotos") {
 
     // Should still work in explore mode
     CHECK(server.hasDefinition(params));
+}
+
+TEST_CASE("CompilationGotos - Module Type Uses BuildFile Without Index") {
+    ServerHarness server("comp_repo");
+
+    server.loadConfig(Config{.indexGlobs = {std::vector<std::string>{"./.../*.sv.disabled"}}});
+    server.setBuildFile("cpu_design.f");
+
+    auto hdl = server.openFile("cpu.sv");
+    auto cursor = hdl.after("// ALU instance").after("\n    ");
+
+    auto defs = cursor.getDefinitions();
+    REQUIRE(defs.size() == 1);
+    CHECK(std::filesystem::path(defs[0].targetUri.getPath()).filename().string() == "alu.sv");
+}
+
+TEST_CASE("CompilationGotos - Module Type Prefers BuildFile Over Indexed Duplicate") {
+    ServerHarness server("comp_repo");
+
+    server.loadConfig(Config{.indexGlobs = {std::vector<std::string>{"*.sv"}}});
+    server.setBuildFile("cpu_design.f");
+
+    auto hdl = server.openFile("cpu.sv");
+    auto cursor = hdl.after("// ALU instance").after("\n    ");
+
+    auto defs = cursor.getDefinitions();
+    REQUIRE(defs.size() == 1);
+    CHECK(std::filesystem::path(defs[0].targetUri.getPath()).filename().string() == "alu.sv");
 }
 
 TEST_CASE("CompilationDiags") {

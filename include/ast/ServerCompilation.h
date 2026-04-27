@@ -69,6 +69,10 @@ public:
     /// Issue all semantic diagnostics from the compilation to the diagnostic engine
     void issueDiagnosticsTo(slang::DiagnosticEngine& diagEngine);
 
+    /// Expose the active elaborated compilation so navigation can use the
+    /// same build context as diagnostics and hierarchy views.
+    slang::ast::Compilation& getCompilation() { return m_analysis->compilation; }
+
     /// Populate incoming / outgoing (drivers / loads) call hierarchy LSP responses
     template<typename P, typename R>
     std::optional<std::vector<R>> getCallHierarchyCalls(const P& params) {
