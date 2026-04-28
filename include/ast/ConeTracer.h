@@ -125,7 +125,9 @@ public:
             if (portSymbol) {
                 leaves.insert(portSymbol);
             }
-            for (const auto driver : drivers) {
+            // Iterate by reference so we do not copy each driver entry just to
+            // insert it into the leaf set.
+            for (const auto& driver : drivers) {
                 leaves.insert(driver);
             }
         }

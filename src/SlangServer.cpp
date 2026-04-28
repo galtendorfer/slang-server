@@ -514,7 +514,9 @@ void SlangServer::loadConfig(const Config& config, bool forceIndexing) {
     m_config = Config(config);
 
     if (m_config.build.value().has_value()) {
-        m_client.showInfo("Using build file: " + *m_config.build.value());
+        // Keep this as a log line instead of a popup so opening the workspace
+        // does not show the same informational notification every time.
+        INFO("Using build file: {}", *m_config.build.value());
         setBuildFile(*m_config.build.value());
     }
     else {

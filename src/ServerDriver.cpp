@@ -513,7 +513,20 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
     if (!loc) {
         return {};
     }
+
+    // Editors often place the cursor just after an identifier, so fall back by
+    // one column and keep using that location for the rest of the lookup.
+    auto effectiveLoc = loc.value();
     const parsing::Token* declTok = analysis->syntaxes.getWordTokenAt(loc.value());
+    if (!declTok && position.character > 0) {
+        auto prevLoc = sm.getSourceLocation(doc->getBuffer(), position.line, position.character - 1);
+        if (prevLoc) {
+            declTok = analysis->syntaxes.getWordTokenAt(prevLoc.value());
+            if (declTok) {
+                effectiveLoc = prevLoc.value();
+            }
+        }
+    }
     if (!declTok) {
         return {};
     }
@@ -587,7 +600,7 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
         // Prefer the active build compilation for instantiation type tokens.
         // Shallow analysis can still see a symbol here, but in duplicate-name
         // workspaces that symbol may come from the wrong file.
-        symbol = tryGetHierarchyInstantiationTypeDefinition(doc, comp.get(), loc.value());
+        symbol = tryGetHierarchyInstantiationTypeDefinition(doc, comp.get(), effectiveLoc);
         if (!symbol) {
             symbol = analysis->getSymbolAtToken(declTok);
         }
@@ -775,7 +788,16 @@ std::optional<std::vector<lsp::DocumentHighlight>> ServerDriver::getDocDocumentH
     if (!loc) {
         return std::nullopt;
     }
+
+    // Match definition / references when the editor reports the cursor at the
+    // end of the token instead of on one of its characters.
     auto declTok = analysis->syntaxes.getWordTokenAt(loc.value());
+    if (!declTok && position.character > 0) {
+        auto prevLoc = sm.getSourceLocation(doc->getBuffer(), position.line, position.character - 1);
+        if (prevLoc) {
+            declTok = analysis->syntaxes.getWordTokenAt(prevLoc.value());
+        }
+    }
     if (!declTok) {
         return std::nullopt;
     }
@@ -874,12 +896,31 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
         return std::nullopt;
     }
 
+    // Keep the adjusted location so build-aware resolution can use the same
+    // token the editor meant even when the request lands one column past it.
+    auto effectiveLoc = loc.value();
+
     const parsing::Token* declTok = analysis->syntaxes.getWordTokenAt(loc.value());
+    if (!declTok && position.character > 0) {
+        auto prevLoc = sm.getSourceLocation(doc->getBuffer(), position.line, position.character - 1);
+        if (prevLoc) {
+            declTok = analysis->syntaxes.getWordTokenAt(prevLoc.value());
+            if (declTok) {
+                effectiveLoc = prevLoc.value();
+            }
+        }
+    }
     if (!declTok) {
         return std::nullopt;
     }
 
-    const ast::Symbol* targetSymbol = analysis->getSymbolAtToken(declTok);
+    // Module instantiation names should come from the active build first, so
+    // duplicate definitions in indexed files do not send references elsewhere.
+    const ast::Symbol* targetSymbol =
+        tryGetHierarchyInstantiationTypeDefinition(doc, comp.get(), effectiveLoc);
+    if (!targetSymbol) {
+        targetSymbol = analysis->getSymbolAtToken(declTok);
+    }
     if (!targetSymbol) {
         return std::nullopt;
     }
