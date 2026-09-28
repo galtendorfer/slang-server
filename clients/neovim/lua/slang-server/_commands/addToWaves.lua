@@ -1,20 +1,22 @@
 -- Parser for :SlangServer addToWaves
 
 local M = {}
+local capabilities = require("slang-server._lsp.capabilities")
 
 ---@type slang-server.ui.Subcommand
 M.addToWaves = {
-   impl = function(args)
+   desc = "Add the object under the cursor to the waveform",
+   required_commands = { "slang.getInstances", "slang.addToWaveform" },
+   context = capabilities.get_current_context,
+   impl = function(args, opts, bufnr)
       local client = require("slang-server._lsp.client")
       local handlers = require("slang-server.handlers")
       local ui = require("slang-server._core.ui")
 
       local recursive = args[1] == "true"
 
-      local bufnr = vim.api.nvim_get_current_buf()
-
-      local first_client = vim.lsp.get_clients({ bufnr = vim.api.nvim_get_current_buf() })[1]
-      local position_encoding = first_client and first_client.offset_encoding or 'utf-16'
+      local lsp_client = assert(capabilities.get_client(bufnr))
+      local position_encoding = lsp_client.offset_encoding or "utf-16"
 
       client.getInstances(bufnr, {
          on_success = function(resp)

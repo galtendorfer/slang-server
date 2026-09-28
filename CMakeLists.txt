@@ -4,7 +4,7 @@
 # ~~~
 
 # slang-server cmake entry point
-cmake_minimum_required(VERSION 3.20...3.29)
+cmake_minimum_required(VERSION 3.28...4.3)
 
 # Determine if slang-server is built as a subproject (using add_subdirectory) or
 # if it is the master project.
@@ -78,10 +78,8 @@ if(SLANG_SERVER_MASTER_PROJECT)
   set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 endif()
 
-# Use slang's bundled fmt library for consistent version across environments
-if(SLANG_SERVER_MASTER_PROJECT AND NOT DEFINED CMAKE_DISABLE_FIND_PACKAGE_fmt)
-  set(CMAKE_DISABLE_FIND_PACKAGE_fmt TRUE)
-endif()
+option(SLANG_SERVER_USE_SYSTEM_FMT
+       "Use a system-installed fmt library instead of slang's bundled fmt" OFF)
 
 if(CMAKE_SYSTEM_NAME MATCHES "Darwin")
   # This ensures that *all* targets (including slang and reflect-cpp) use the
@@ -232,37 +230,49 @@ set(SLANG_INCLUDE_TESTS
     OFF
     CACHE BOOL "Don't build slang tests" FORCE)
 
-# Set up Catch2 for testing
-set(find_pkg_args "")
+if(SLANG_SERVER_INCLUDE_TESTS)
+  # Set up Catch2 for testing
+  set(find_pkg_args "")
 
-if(${CMAKE_VERSION} VERSION_GREATER_EQUAL "3.24.0")
-  set(find_pkg_args "FIND_PACKAGE_ARGS" "${catch2_min_version}")
+  if(CMAKE_VERSION VERSION_GREATER_EQUAL "3.24.0")
+    set(find_pkg_args "FIND_PACKAGE_ARGS" "${catch2_min_version}")
+  endif()
+
+  FetchContent_Declare(
+    Catch2
+    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
+    GIT_TAG v3.10.0
+    GIT_SHALLOW ON
+    ${find_pkg_args})
+  FetchContent_MakeAvailable(Catch2)
+
+  if(NOT TARGET Catch2::Catch2)
+    message(
+      FATAL_ERROR
+        "Could not find Catch2 package, min version: ${catch2_min_version}")
+  endif()
+
+  if(Catch2_FOUND)
+    get_target_property(Catch2_INCLUDE_DIR Catch2::Catch2
+                        INTERFACE_INCLUDE_DIRECTORIES)
+    message(STATUS "Found system Catch2 version: ${Catch2_VERSION}")
+    message(STATUS "Using system Catch2 include: ${Catch2_INCLUDE_DIR}")
+  else()
+    message(STATUS "Using remote Catch2 library")
+  endif()
+
+  enable_testing()
+  add_subdirectory(tests/cpp)
 endif()
 
-FetchContent_Declare(
-  Catch2
-  GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-  GIT_TAG v3.10.0
-  GIT_SHALLOW ON
-  ${find_pkg_args})
-FetchContent_MakeAvailable(Catch2)
-
-if(NOT TARGET Catch2::Catch2)
-  message(
-    FATAL_ERROR
-      "Could not find Catch2 package, min version: ${catch2_min_version}")
-endif()
-
-if(Catch2_FOUND)
-  get_target_property(Catch2_INCLUDE_DIR Catch2::Catch2
-                      INTERFACE_INCLUDE_DIRECTORIES)
-  message(STATUS "Found system Catch2 version: ${Catch2_VERSION}")
-  message(STATUS "Using system Catch2 include: ${Catch2_INCLUDE_DIR}")
-else()
-  message(STATUS "Using remote Catch2 library")
-endif()
-
+set(SLANG_USE_SYSTEM_FMT
+    ${SLANG_SERVER_USE_SYSTEM_FMT}
+    CACHE BOOL "Use a system-installed fmt library instead of FetchContent"
+          FORCE)
 add_subdirectory(external/slang)
+if(SLANG_SERVER_USE_SYSTEM_FMT AND NOT TARGET fmt::fmt)
+  find_package(fmt REQUIRED)
+endif()
 add_subdirectory(external/reflect-cpp)
 add_subdirectory(external/ctre)
 
@@ -280,9 +290,12 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/src/util/VersionInfo.cpp.in
 add_library(
   slang_server_obj_lib OBJECT
   ${CMAKE_CURRENT_BINARY_DIR}/VersionInfo.cpp
+  src/SystemTaskDocs.cpp
+  src/ast/ActiveDesignContext.cpp
   src/ast/ServerCompilation.cpp
   src/ast/ServerCompilationAnalysis.cpp
   src/ast/WcpClient.cpp
+  src/document/DefinitionInfo.cpp
   src/document/ShallowAnalysis.cpp
   src/document/SlangDoc.cpp
   src/document/SymbolIndexer.cpp
@@ -292,16 +305,20 @@ add_library(
   src/codeactions/AddDefine.cpp
   src/codeactions/CodeActionDispatch.cpp
   src/codeactions/ExpandMacro.cpp
-  src/completions/Completions.cpp
+  src/completions/AssignmentPatternCompletions.cpp
   src/completions/CompletionContext.cpp
   src/completions/CompletionDispatch.cpp
+  src/completions/InstanceCompletions.cpp
+  src/completions/KeywordCompletions.cpp
+  src/completions/MacroCompletions.cpp
+  src/completions/MemberCompletions.cpp
+  src/completions/SystemTaskCompletions.cpp
   src/lsp/URI.cpp
   src/util/Converters.cpp
   src/util/Formatting.cpp
   src/util/SlangExtensions.cpp
   src/util/Markdown.cpp
   src/Config.cpp
-  src/Hovers.cpp
   src/Indexer.cpp
   src/ServerDriver.cpp
   src/SlangServer.cpp
@@ -314,13 +331,17 @@ target_include_directories(slang_server_obj_lib SYSTEM
 target_precompile_headers(slang_server_obj_lib PRIVATE
                           "${PROJECT_SOURCE_DIR}/include/lsp/LspTypes.h")
 
-target_link_libraries(slang_server_obj_lib PUBLIC slang::slang ctre)
+target_link_libraries(slang_server_obj_lib PUBLIC slang::slang fmt::fmt ctre)
 
 # Apply pedantic warnings only to slang-server code, not external libraries
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
   target_compile_options(
     slang_server_obj_lib PRIVATE -Wpedantic -Wpessimizing-move -Wno-nonnull
                                  -Wno-unused-parameter -Werror)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(slang_server_obj_lib
+                           PRIVATE -Wno-maybe-uninitialized)
+  endif()
   # Stricter unused variable warnings only in CI builds
   if(SLANG_CI_BUILD)
     target_compile_options(
@@ -358,9 +379,4 @@ endif()
 
 if(SLANG_SERVER_INCLUDE_INSTALL)
   install(TARGETS slang_server RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-endif()
-
-if(SLANG_SERVER_INCLUDE_TESTS)
-  enable_testing()
-  add_subdirectory(tests/cpp)
 endif()

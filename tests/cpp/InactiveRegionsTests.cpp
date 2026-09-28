@@ -15,6 +15,32 @@ struct RegionInfo {
     std::string text;
 };
 
+TEST_CASE("ClientCapabilities_ExtractsSupportedFeatures") {
+    auto capabilities = rfl::json::read<lsp::ClientCapabilities>(R"(
+{
+  "textDocument": {
+    "definition": {"linkSupport": true},
+    "completion": {
+      "completionItem": {
+        "resolveSupport": {
+          "properties": ["insertText", "insertTextFormat", "textEdit"]
+        }
+      }
+    }
+  },
+  "experimental": {
+    "inactiveRegions": {"inactiveRegions": true}
+  }
+}
+)");
+    REQUIRE(capabilities);
+
+    SlangLspClient::Capabilities extracted(*capabilities);
+    CHECK(extracted.definitionLinksSupported);
+    CHECK(extracted.completionEditResolveSupported);
+    CHECK(extracted.inactiveRegionsSupported);
+}
+
 TEST_CASE("InactiveRegions_SyntaxIndexer") {
     using namespace slang;
 
@@ -62,7 +88,7 @@ logic h;
 
     std::vector<RegionInfo> regions;
     for (auto& r : disabled) {
-        regions.push_back({toRange(r, sm), std::string(sm.getText(r))});
+        regions.push_back({toRange(r, sm), std::string(sm.getSourceText(r))});
     }
 
     golden.record(regions);
@@ -87,8 +113,34 @@ TEST_CASE("InactiveRegions_ParseError") {
     auto& disabled = indexer.disabledRegions;
 
     REQUIRE(disabled.size() == 1);
-    auto text = std::string(sm.getText(disabled[0]));
+    auto text = std::string(sm.getSourceText(disabled[0]));
     CHECK(text.find("`ASDF") != std::string::npos);
+}
+
+TEST_CASE("SyntaxIndexer retains synthesized recovery tokens for context") {
+    using namespace slang;
+
+    SourceManager sm;
+    Bag options;
+    std::string_view text = R"(
+module top;
+    logic value;
+
+    assign
+    endmodule
+)";
+    auto tree = syntax::SyntaxTree::fromText(text, sm, "test", "", options);
+
+    server::SyntaxIndexer indexer(*tree);
+    auto missing = std::ranges::find_if(indexer.collected,
+                                        [](const auto* token) { return token->isMissing(); });
+    REQUIRE(missing != indexer.collected.end());
+    CHECK(indexer.getTokenParent(*missing) != nullptr);
+
+    auto cursor = SourceLocation(tree->getSourceBufferIds()[0], text.find("assign\n") + 7);
+    auto context = indexer.getSyntaxAt(cursor);
+    REQUIRE(context);
+    CHECK(context->kind == syntax::SyntaxKind::ContinuousAssign);
 }
 
 TEST_CASE("InactiveRegions_MacroInDisabledBranch") {
@@ -113,7 +165,7 @@ TEST_CASE("InactiveRegions_MacroInDisabledBranch") {
 
     // The macro usage `WIDTH should not split the disabled region
     REQUIRE(disabled.size() == 1);
-    CHECK(sm.getText(disabled[0]) == "logic [`WIDTH-1:0] a;");
+    CHECK(sm.getSourceText(disabled[0]) == "logic [`WIDTH-1:0] a;");
 }
 
 TEST_CASE("InactiveRegions_NestedDirectivesMerged") {
@@ -147,7 +199,7 @@ TEST_CASE("InactiveRegions_NestedDirectivesMerged") {
     // Each region should include the full inner `ifndef/`endif block.
     REQUIRE(disabled.size() == 3);
     for (auto& region : disabled) {
-        auto text = std::string(sm.getText(region));
+        auto text = std::string(sm.getSourceText(region));
         CHECK(text.find("`ifndef FLAG_X") != std::string::npos);
         CHECK(text.find("`endif") != std::string::npos);
     }
@@ -193,8 +245,9 @@ endmodule
     auto& syntaxes = doc.doc->getAnalysis()->syntaxes;
 
     std::vector<RegionInfo> regions;
+    regions.reserve(syntaxes.disabledRegions.size());
     for (auto& r : syntaxes.disabledRegions) {
-        regions.push_back({toRange(r, sm), std::string(sm.getText(r))});
+        regions.push_back({toRange(r, sm), std::string(sm.getSourceText(r))});
     }
 
     golden.record(regions);

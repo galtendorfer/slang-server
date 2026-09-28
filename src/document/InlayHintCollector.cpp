@@ -8,12 +8,14 @@
 #include "util/Converters.h"
 #include "util/Formatting.h"
 #include "util/Logging.h"
+#include "util/SlangExtensions.h"
 
 #include "slang/ast/Symbol.h"
 #include "slang/ast/symbols/ClassSymbols.h"
 #include "slang/ast/symbols/CompilationUnitSymbols.h"
 #include "slang/ast/symbols/InstanceSymbols.h"
 #include "slang/ast/symbols/MemberSymbols.h"
+#include "slang/ast/symbols/ParameterSymbols.h"
 #include "slang/ast/symbols/PortSymbols.h"
 #include "slang/syntax/AllSyntax.h"
 #include "slang/syntax/SyntaxKind.h"
@@ -27,19 +29,45 @@ using namespace slang;
 static SourceLocation getArgumentHintLoc(const ArgumentSyntax& syntax,
                                          const ShallowAnalysis& analysis) {
     auto& sourceManager = analysis.getSourceManager();
-    if (auto info = sourceManager.getMacroInfo(syntax.getFirstToken().location())) {
-        return sourceManager.getFullyOriginalLoc(info->expansionRange.start());
-    }
+    auto loc = syntax.sourceRange().start();
+    if (sourceManager.isMacroLoc(loc))
+        return sourceManager.getFullyExpandedLoc(loc);
 
-    return sourceManager.getFullyOriginalLoc(syntax.sourceRange().start());
+    return sourceManager.getFullyOriginalLoc(loc);
 }
 
 InlayHintCollector::InlayHintCollector(const ShallowAnalysis& analysis, lsp::Range range,
                                        const Config::InlayHints& config) :
     m_analysis(analysis), m_range(range), m_portTypes(config.portTypes.value()),
+    m_assignmentPatternTypes(config.assignmentPatternTypes.value()),
+    m_activeParameterValues(config.activeParameterValues.value()),
     m_orderedInstanceNames(config.orderedInstanceNames.value()),
     m_wildcardNames(config.wildcardNames.value()), m_funcArgNames(config.funcArgNames.value()),
     m_macroArgNames(config.macroArgNames.value()) {
+}
+
+void InlayHintCollector::handle(const ParameterDeclarationSyntax& syntax) {
+    if (!m_activeParameterValues)
+        return;
+
+    for (auto* declarator : syntax.declarators) {
+        auto* shallowSymbol = m_analysis.getSymbolAtToken(&declarator->name);
+        auto* designSymbol = shallowSymbol ? m_analysis.getDesignSymbol(*shallowSymbol) : nullptr;
+        auto* parameter = designSymbol ? designSymbol->as_if<ast::ParameterSymbol>() : nullptr;
+        if (!parameter)
+            continue;
+
+        const auto& value = parameter->getValue();
+        if (value.bad())
+            continue;
+
+        result.push_back(lsp::InlayHint{
+            .position = toPosition(declarator->name.range().end(), m_analysis.m_sourceManager),
+            .label = formatConstantValue(value),
+            .kind = lsp::InlayHintKind::Parameter,
+            .paddingLeft = true,
+        });
+    }
 }
 
 void InlayHintCollector::handle(const HierarchyInstantiationSyntax& syntax) {
@@ -188,7 +216,7 @@ void InlayHintCollector::handle(const HierarchyInstantiationSyntax& syntax) {
                                     FORMATTING_INDENT - 1;
 
                     auto getLine = [&](const auto& loc) {
-                        return m_analysis.m_sourceManager.getLineNumber(loc);
+                        return m_analysis.m_sourceManager.getRawLineNumber(loc);
                     };
 
                     if (getLine(instanceSyntax->openParen.location()) ==
@@ -340,28 +368,85 @@ void InlayHintCollector::handle(const ClassNameSyntax& syntax) {
     }
     size_t paramIndex = 0;
     for (auto paramSyntax : syntax.parameters->parameters) {
-        if (paramSyntax->kind == SyntaxKind::OrderedParamAssignment &&
-            paramIndex < cls.genericClass->paramDecls.size()) {
-            result.push_back(lsp::InlayHint{
-                .position = toPosition(paramSyntax->getFirstToken().location(),
-                                       m_analysis.m_sourceManager),
-                .label = fmt::format("{}:", cls.genericClass->paramDecls[paramIndex++].name),
-                .kind = lsp::InlayHintKind::Parameter,
-                .paddingRight = true,
-            });
+        if (paramSyntax->kind != SyntaxKind::OrderedParamAssignment) {
+            continue;
+        }
+        auto paramDecls = cls.genericClass->getParameterDecls();
+        if (paramIndex >= paramDecls.size()) {
+            continue;
+        }
+        result.push_back(lsp::InlayHint{
+            .position = toPosition(paramSyntax->getFirstToken().location(),
+                                   m_analysis.m_sourceManager),
+            .label = fmt::format("{}:", paramDecls[paramIndex++].name),
+            .kind = lsp::InlayHintKind::Parameter,
+            .paddingRight = true,
+        });
+    }
+}
+
+void InlayHintCollector::handle(const AssignmentPatternExpressionSyntax& syntax) {
+    if (!m_assignmentPatternTypes || syntax.type)
+        return;
+
+    auto* target = m_analysis.getAssignmentPatternTargetSymbol(syntax);
+    if (!target)
+        return;
+
+    auto* declaredType = target->getDeclaredType();
+    const ast::Type* type = nullptr;
+    if (target->isType())
+        type = &target->as<ast::Type>();
+    else if (declaredType)
+        type = &declaredType->getType();
+    if (!type || (!unwrapErrorType(*type).isStruct() && !unwrapErrorType(*type).isUnion()))
+        return;
+
+    const ast::Symbol* namedType = nullptr;
+    if (auto* resolvedType = getTypeParameterTargetType(*type);
+        resolvedType && !resolvedType->name.empty())
+        namedType = resolvedType;
+    if (!namedType && !type->name.empty())
+        namedType = type;
+    if (!namedType && declaredType) {
+        if (auto* typeSyntax = declaredType->getTypeSyntax()) {
+            auto* token = m_analysis.syntaxes.getTokenAt(typeSyntax->getLastToken().location());
+            namedType = m_analysis.getSymbolAtToken(token);
         }
     }
+    if (!namedType || !namedType->isType() || namedType->name.empty())
+        return;
+
+    auto label = std::string(namedType->name);
+    if (auto* parent = namedType->getParentScope()) {
+        auto parentKind = parent->asSymbol().kind;
+        if (parentKind == ast::SymbolKind::Package || parentKind == ast::SymbolKind::ClassType)
+            label = namedType->getLexicalPath();
+    }
+
+    auto location = syntax.pattern->getFirstToken().location();
+    auto position = toPosition(location, m_analysis.m_sourceManager);
+    auto typeLocation = toLocation(SourceRange(namedType->location,
+                                               namedType->location + namedType->name.size()),
+                                   m_analysis.m_sourceManager);
+    result.push_back(lsp::InlayHint{
+        .position = position,
+        .label = std::vector<lsp::InlayHintLabelPart>{lsp::InlayHintLabelPart{
+            .value = label,
+            .location = std::move(typeLocation),
+        }},
+        .kind = lsp::InlayHintKind::Type,
+        .textEdits = std::vector<lsp::TextEdit>{lsp::TextEdit{
+            .range = lsp::Range{.start = position, .end = position}, .newText = std::move(label)}},
+    });
 }
 
 void InlayHintCollector::collectHints() {
 
-    auto slangStart = m_analysis.m_sourceManager.getSourceLocation(m_analysis.m_buffer,
-                                                                   m_range.start.line,
-                                                                   m_range.start.character);
+    auto slangStart = toSourceLocation(m_analysis.m_buffer, m_range.start,
+                                       m_analysis.m_sourceManager);
 
-    auto slangEnd = m_analysis.m_sourceManager.getSourceLocation(m_analysis.m_buffer,
-                                                                 m_range.end.line,
-                                                                 m_range.end.character);
+    auto slangEnd = toSourceLocation(m_analysis.m_buffer, m_range.end, m_analysis.m_sourceManager);
     if (!slangStart || !slangEnd) {
         ERROR("Invalid range for inlay hints");
         return;
@@ -380,6 +465,9 @@ void InlayHintCollector::collectHints() {
 
     for (auto it = start; it != end; ++it) {
         switch (it->second->kind) {
+            case syntax::SyntaxKind::ParameterDeclaration:
+                handle(it->second->as<ParameterDeclarationSyntax>());
+                break;
             case syntax::SyntaxKind::HierarchyInstantiation:
                 handle(it->second->as<HierarchyInstantiationSyntax>());
                 break;
@@ -391,6 +479,10 @@ void InlayHintCollector::collectHints() {
                 break;
             case syntax::SyntaxKind::ClassName:
                 handle(it->second->as<ClassNameSyntax>());
+                break;
+            case syntax::SyntaxKind::AssignmentPatternExpression:
+                handle(it->second->as<AssignmentPatternExpressionSyntax>());
+                break;
             default:
                 break;
         }

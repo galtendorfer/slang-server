@@ -43,6 +43,8 @@ private:
 
     // Cached config values
     bool m_portTypes;
+    bool m_assignmentPatternTypes;
+    bool m_activeParameterValues;
     bool m_orderedInstanceNames;
     bool m_wildcardNames;
     int m_funcArgNames;
@@ -51,6 +53,7 @@ private:
     /// Handle instances- will show port/param names if ordered, names for wildcards, and types for
     /// named ports
     void handle(const slang::syntax::HierarchyInstantiationSyntax& syntax);
+    void handle(const slang::syntax::ParameterDeclarationSyntax& syntax);
 
     /// Handle function calls- will show argument names for calls with more than one arg
     void handle(const slang::syntax::InvocationExpressionSyntax& syntax);
@@ -59,6 +62,8 @@ private:
     void handle(const slang::syntax::MacroUsageSyntax& syntax);
 
     void handle(const slang::syntax::ClassNameSyntax& syntax);
+
+    void handle(const slang::syntax::AssignmentPatternExpressionSyntax& syntax);
 };
 
 } // namespace server

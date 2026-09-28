@@ -4,29 +4,40 @@ on:
   workflow_dispatch:
     inputs:
       kind:
-        description: 'Update kind (major, minor, patch)'
-        required: true
+        description: 'Update kind (major, minor, patch). Ignored when existing_tag is set.'
+        required: false
         type: choice
         options:
           - patch
           - minor
           - major
         default: 'patch'
+      existing_tag:
+        description: 'Amend an existing release tag (e.g. v0.2.6) by re-running build + asset upload. Skips version bump and release creation.'
+        required: false
+        type: string
+        default: ''
+      dry_run:
+        description: 'Build the selected ref and prepare release artifacts without publishing or pushing changes.'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
   create-release:
+    if: inputs.existing_tag == ''
     runs-on: ubuntu-latest
     outputs:
       tag_name: ${{ steps.create_tag.outputs.tag_name }}
       version: ${{ steps.bump_version.outputs.version }}
     steps:
-      - name: Checkout main branch
+      - name: Checkout release source
         uses: actions/checkout@v6
         with:
-          ref: main
+          ref: ${{ inputs.dry_run && github.ref || 'main' }}
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -60,25 +71,30 @@ jobs:
           echo "New version: $NEW_VERSION"
           echo "version=$NEW_VERSION" >> $GITHUB_OUTPUT
 
-      - name: Update VERSION file
+      - name: Update versions
         run: |
           VERSION="${{ steps.bump_version.outputs.version }}"
           echo "$VERSION" > VERSION
+          CLIENT_VERSION="${VERSION%.*}"
+          sed -i "s/^M\\.CLIENT_VERSION = .*/M.CLIENT_VERSION = \"$CLIENT_VERSION\"/" clients/neovim/lua/slang-server/_lsp/capabilities.lua
           echo "Updated VERSION to: $VERSION"
           cat VERSION
+          echo "Updated Neovim client version to: $CLIENT_VERSION"
 
-      - name: Commit VERSION update
+      - name: Commit version update
+        if: inputs.dry_run == false
         run: |
           VERSION="${{ steps.bump_version.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add VERSION
+          git add VERSION clients/neovim/lua/slang-server/_lsp/capabilities.lua
           git commit -m "Update VERSION to $VERSION"
           git push origin main
           echo "Committed VERSION update to main"
 
       - name: Create and push tag
         id: create_tag
+        if: inputs.dry_run == false
         run: |
           VERSION="${{ steps.bump_version.outputs.version }}"
           TAG_NAME="v$VERSION"
@@ -88,6 +104,7 @@ jobs:
           echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
 
       - name: Create GitHub release
+        if: inputs.dry_run == false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -101,13 +118,18 @@ jobs:
 
   build:
     needs: create-release
+    if: always() && (needs.create-release.result == 'success' || needs.create-release.result == 'skipped')
     uses: ./.github/workflows/build.yml
     with:
       upload_artifacts: true
-      ref: main # Build from main branch with updated VERSION
+      # If amending, build from the existing tag so binaries match the release.
+      # Dry runs build the ref selected when dispatching the workflow. Otherwise,
+      # build from main, which now has the bumped VERSION committed.
+      ref: ${{ inputs.existing_tag || (inputs.dry_run && github.ref) || 'main' }}
 
   add-release-assets:
     needs: [create-release, build]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
 
     steps:
@@ -137,44 +159,28 @@ jobs:
             ls -lh release-assets/
           fi
 
-      - name: Get release info
-        if: steps.prepare.outputs.has_artifacts == 'true'
-        id: release
+      - name: Upload assets to release
+        if: steps.prepare.outputs.has_artifacts == 'true' && inputs.dry_run == false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME="${{ needs.create-release.outputs.tag_name }}"
-          echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
-
-          # Get existing release notes
-          RELEASE_NOTES=$(gh release view "$TAG_NAME" --json body -q .body)
-          echo "notes<<EOF" >> $GITHUB_OUTPUT
-          echo "$RELEASE_NOTES" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Generate checksums and update release
-        if: steps.prepare.outputs.has_artifacts == 'true'
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          TAG_NAME="${{ steps.release.outputs.tag }}"
-
-          # Generate checksums
-          cd release-assets
-          CHECKSUMS=$(sha256sum * | sed 's/^/    /')
-          cd ..
-
-          # Append checksums to release notes
-          cat > updated-notes.md << 'EOF'
-          ${{ steps.release.outputs.notes }}
-
-          ## Checksums
-
-          ```
-          EOF
-          echo "$CHECKSUMS" >> updated-notes.md
-          echo '```' >> updated-notes.md
-
-          # Update release with checksums and upload artifacts
-          gh release edit "$TAG_NAME" --notes-file updated-notes.md
+          TAG_NAME="${{ inputs.existing_tag || needs.create-release.outputs.tag_name }}"
           gh release upload "$TAG_NAME" release-assets/* --clobber
+
+  publish-vscode:
+    needs: [create-release, add-release-assets]
+    if: needs.create-release.result == 'success' && needs.add-release-assets.result == 'success' && inputs.kind != 'patch' && inputs.dry_run == false
+    uses: ./.github/workflows/vscode-publish.yml
+    with:
+      kind: ${{ inputs.kind }}
+      prerelease: false
+    secrets: inherit
+
+  publish-neovim:
+    needs: [create-release, add-release-assets]
+    if: needs.create-release.result == 'success' && needs.add-release-assets.result == 'success' && inputs.kind != 'patch' && inputs.dry_run == false
+    uses: ./.github/workflows/neovim-sync.yml
+    with:
+      ref: main
+      sync_event: push
+    secrets: inherit

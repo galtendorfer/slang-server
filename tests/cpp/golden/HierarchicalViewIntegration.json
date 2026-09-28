@@ -127,7 +127,7 @@
               "character": 0
             },
             "end": {
-              "line": 19,
+              "line": 36,
               "character": 9
             }
           }
@@ -184,6 +184,8 @@
             }
           }
         },
+        "declKind": "Module",
+        "hasChildren": true,
         "children": [
           {
             "kind": "Logic",
@@ -395,6 +397,8 @@
                 }
               }
             },
+            "declKind": "Module",
+            "hasChildren": true,
             "children": []
           },
           {
@@ -631,6 +635,8 @@
             }
           }
         },
+        "declKind": "Module",
+        "hasChildren": true,
         "children": []
       },
       {

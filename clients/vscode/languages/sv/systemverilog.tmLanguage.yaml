@@ -19,22 +19,56 @@ patterns:
   - include: '#enum-struct-union'
   - include: '#sequence'
   - include: '#all-types'
+  - include: '#assertion'
   - include: '#module-parameters'
+  - include: '#assignment-expression'
   - include: '#module-no-parameters-split'
   - include: '#module-no-parameters'
   - include: '#port-net-parameter'
   - include: '#system-tf'
-  - include: '#assertion'
   - include: '#bind-directive'
   - include: '#cast-operator'
   - include: '#storage-scope'
   - include: '#attributes'
+  - include: '#dpi-import-export'
   - include: '#imports'
   - include: '#operators'
   - include: '#constants'
   - include: '#identifiers'
   - include: '#selects'
 repository:
+  assignment-expression:
+    begin: '>>>=|>>=|<<<=|<<=|\+=|-=|/=|\*=|%=|&=|\|=|\^=|<=|(?<![<>=!])=(?!=)'
+    beginCaptures:
+      '0':
+        name: keyword.operator.assignment.systemverilog
+    end: (?=;)
+    patterns:
+      - include: '#assignment-concatenation'
+      - include: '#expression'
+  assignment-concatenation:
+    begin: \{
+    end: \}
+    patterns:
+      - include: '#concatenation-body'
+      - include: '#expression'
+    name: meta.concatenation.assignment.systemverilog
+  concatenation-body:
+    begin: \{
+    end: \}
+    patterns:
+      - include: '#concatenation-body'
+      - include: '#expression'
+    name: meta.concatenation.systemverilog
+  expression:
+    patterns:
+      - include: '#functions'
+      - include: '#keywords'
+      - include: '#system-tf'
+      - include: '#cast-operator'
+      - include: '#base-grammar'
+      - include: '#identifiers'
+      - include: '#selects'
   function-task:
     begin: '[ \t\r\n]*(?:\b(virtual)[ \t\r\n]+)?(?:\b(function|task)\b)(?:[ \t\r\n]+\b(static|automatic)\b)?'
     beginCaptures:
@@ -208,13 +242,16 @@ repository:
         name: entity.name.type.module.systemverilog
     name: meta.definition.systemverilog
   assertion:
-    match: \b([a-zA-Z_][a-zA-Z0-9_$]*)[ \t\r\n]*(:)[ \t\r\n]*(assert|assume|cover|restrict)\b
+    match: >-
+      [ \t\r\n]*(?:\b([a-zA-Z_][a-zA-Z0-9_$]*)[ \t\r\n]*(:)[ \t\r\n]*)?\b(assert|assume|cover|restrict)\b(?:[ \t\r\n]+(property|sequence|final)\b)?
     captures:
       '1':
         name: entity.name.goto-label.php
       '2':
         name: keyword.operator.systemverilog
       '3':
+        name: keyword.sva.systemverilog
+      '4':
         name: keyword.sva.systemverilog
   compiler-directives:
     patterns:
@@ -244,7 +281,7 @@ repository:
           '2':
             name: string.regexp.systemverilog
         name: meta.crypto.systemverilog
-      - begin: (`[a-zA-Z_][a-zA-Z0-9_$]*)\(
+      - begin: (?<!`)(`[a-zA-Z_][a-zA-Z0-9_$]*)\(
         beginCaptures:
           '1':
             name: entity.name.function.macro.systemverilog
@@ -257,6 +294,10 @@ repository:
           - include: '#operators'
           - include: '#system-tf'
           - include: '#all-types'
+      - match: (?<!`)(`[a-zA-Z_][a-zA-Z0-9_$]*)\b(?!\()
+        captures:
+          '1':
+            name: entity.name.function.macro.systemverilog
     name: meta.preprocessor.systemverilog
   macro-parens:
     begin: \(
@@ -534,7 +575,7 @@ repository:
     name: meta.module.instantiation.systemverilog
   module-no-parameters-split:
     begin: >-
-      [ \t\r\n]*\b(?:(bind|pullup|pulldown)[ \t\r\n]+(?:([a-zA-Z_][a-zA-Z0-9_$\.]*)[ \t\r\n]+)?)?((?:\b(?:and|nand|or|nor|xor|xnor|buf|not|bufif[01]|notif[01]|r?[npc]mos|r?tran|r?tranif[01])\b|[a-zA-Z_][a-zA-Z0-9_$]*))[ \t\r\n]*$
+      ^[ \t]*\b(?:(bind|pullup|pulldown)[ \t]+(?:([a-zA-Z_][a-zA-Z0-9_$\.]*)[ \t]+)?)?((?:\b(?:and|nand|or|nor|xor|xnor|buf|not|bufif[01]|notif[01]|r?[npc]mos|r?tran|r?tranif[01])\b|[a-zA-Z_][a-zA-Z0-9_$]*))[ \t]*$
     beginCaptures:
       '1':
         name: keyword.control.systemverilog
@@ -926,6 +967,37 @@ repository:
       - include: '#constants'
       - include: '#strings'
     name: meta.attribute.systemverilog
+  dpi-import-export:
+    # Two alternatives encode the positional asymmetry of the c_identifier
+    # alias around `=`: import puts the c_identifier *before* `=`
+    # (`import "DPI-C" my_c_name = function ...`); export puts it *after*
+    # (`export "DPI-C" = my_c_name function ...`). A single
+    # `(id?)\s*=\s*(id?)` form would over-match by accepting both sides at once.
+    #
+    # The trailing `function|task` keyword is captured here (not delegated to
+    # `#function-task`) so it gets the same `keyword.control` color as the rest
+    # of the DPI declaration. Side-effect: the function name and parameter list
+    # fall through to default identifier patterns instead of being treated as a
+    # function definition body.
+    match: '[ \t\r\n]*\b(import|export)[ \t\r\n]+("DPI(?:-C)?")(?:[ \t\r\n]+\b(pure|context)\b)?(?:[ \t\r\n]+(?:([a-zA-Z_][a-zA-Z0-9_$]*)[ \t\r\n]*(=)|(=)[ \t\r\n]*([a-zA-Z_][a-zA-Z0-9_$]*)))?(?:[ \t\r\n]+\b(function|task)\b)?'
+    captures:
+      '1':
+        name: keyword.control.systemverilog
+      '2':
+        name: string.quoted.double.systemverilog
+      '3':
+        name: keyword.control.systemverilog
+      '4':
+        name: entity.name.function.systemverilog
+      '5':
+        name: keyword.operator.assignment.systemverilog
+      '6':
+        name: keyword.operator.assignment.systemverilog
+      '7':
+        name: entity.name.function.systemverilog
+      '8':
+        name: keyword.control.systemverilog
+    name: meta.import.dpi.systemverilog
   imports:
     match: '[ \t\r\n]*\b(import|export)[ \t\r\n]+([a-zA-Z_][a-zA-Z0-9_$]*|\*)[ \t\r\n]*(::)[ \t\r\n]*([a-zA-Z_][a-zA-Z0-9_$]*|\*)[ \t\r\n]*(,|;)'
     captures:

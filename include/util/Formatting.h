@@ -3,7 +3,9 @@
 
 #pragma once
 
+#include "Config.h"
 #include "lsp/LspTypes.h"
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -43,10 +45,14 @@ bool isSingleLine(const std::string& s);
 
 std::string detailFormat(const syntax::SyntaxNode& node);
 
-/// Strip the comment markers from a doc comment so we can
-/// display the documentation nicely (and depending on the ide
-/// render markdown)
-std::string stripDocComment(const syntax::SyntaxNode& node);
+std::optional<std::string> getDeclaredTypeString(const ast::ValueSymbol& value);
+
+/// Extract the leading doc comment text from a node, with comment markers stripped.
+/// In plaintext mode, markdown characters are escaped so the text renders as-is.
+/// Should not be called with `raw` — raw mode renders the node with leading comments
+/// directly via formatCodeWithLeadingComments.
+std::string getDocCommentForHover(const syntax::SyntaxNode& node,
+                                  const Config::HoverConfig::DocCommentFormat format);
 
 /// Select the best syntax node to display for hover/code snippets
 const syntax::SyntaxNode& selectDisplayNode(const syntax::SyntaxNode& node);
@@ -56,6 +62,9 @@ std::string formatDocComment(const syntax::SyntaxNode& node);
 
 /// Format a syntax node's code excluding leading comments as plain text
 std::string formatCode(const syntax::SyntaxNode& node);
+
+/// Format a syntax node's code with its leading comments as plain text
+std::string formatCodeWithLeadingComments(const syntax::SyntaxNode& node);
 
 std::string svCodeBlockString(std::string_view code);
 std::string svCodeBlockString(const syntax::SyntaxNode& node);
@@ -74,33 +83,25 @@ std::string toCamelCase(std::string_view str);
 /// Convert a string to lower case
 std::string toLowerCase(std::string_view str);
 
-/// @brief Format a ConstantValue for display in hovers
-/// For string values, shows escaped invalid UTF-8 characters
+/// @brief Format a ConstantValue for display to users
+/// Uses compact notation for scalar bits and escapes invalid UTF-8 strings.
 std::string formatConstantValue(const slang::ConstantValue& value);
 
+enum class TypeStringMode {
+    /// Uses Slang's canonical type spelling without Markdown quoting.
+    Canonical,
+    /// Uses Slang's friendly type spelling without Markdown quoting.
+    Friendly,
+    /// Uses Slang's friendly type spelling and Markdown-quotes type names.
+    FriendlyMarkdownQuoted
+};
+
 // Print the canonical type nicely, if it's a type alias
-template<bool isMarkdown>
-std::string getTypeStringImpl(const ast::Type& type);
+std::string getTypeString(const ast::Type& type, TypeStringMode mode = TypeStringMode::Canonical);
 
 // Print a type of a value symbol nicely, including the canonical type and port direction if
 // applicable
-template<bool isMarkdown>
-std::string getTypeStringImpl(const ast::ValueSymbol& value);
-
-// Plain text versions
-inline std::string getTypeString(const ast::Type& type) {
-    return getTypeStringImpl<false>(type);
-}
-inline std::string getTypeString(const ast::ValueSymbol& value) {
-    return getTypeStringImpl<false>(value);
-}
-
-// Hover/Markdown versions
-inline std::string getHoverTypeString(const ast::Type& type) {
-    return getTypeStringImpl<true>(type);
-}
-inline std::string getHoverTypeString(const ast::ValueSymbol& value) {
-    return getTypeStringImpl<true>(value);
-}
+std::string getTypeString(const ast::ValueSymbol& value,
+                          TypeStringMode mode = TypeStringMode::Canonical);
 
 } // namespace server

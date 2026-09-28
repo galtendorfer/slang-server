@@ -8,11 +8,17 @@
 export interface Config {
   /** Flags to pass to slang */
   flags?: string
-  /** Deprecated: use 'index' instead. Globs of what to index. By default will index all sv and svh files in the workspace. */
+  /**
+   * @deprecated
+   * Globs of what to index. By default will index all sv and svh files in the workspace.
+   */
   indexGlobs?: string[]
   /** Index configurations; by default indexes all .sv, .svh, .v, and .vh files in the workspace. */
   index?: Config__IndexConfig[]
-  /** Deprecated: use 'index' instead. Directories to exclude */
+  /**
+   * @deprecated
+   * Directories to exclude
+   */
   excludeDirs?: string[]
   /** Thread count to use for indexing */
   indexingThreads?: number
@@ -26,6 +32,8 @@ export interface Config {
   wavesPattern?: string | null
   /** Waveform viewer command ({} will be replaced with the WCP port), used for direct wcp connection with neovim and surfer. */
   wcpCommand?: string | null
+  /** Hover behavior settings */
+  hovers?: Config__HoverConfig
   /** Inline hints for things like ordered arguments, wildcard ports, and others */
   inlayHints?: Config__InlayHints
   /** Builds for direct .f selection or command-based .f generation */
@@ -41,6 +49,11 @@ export interface Config__Build {
   command?: string
 }
 
+export interface Config__HoverConfig {
+  /** How to render leading doc comments in hovers: 'markdown' renders as markdown, 'plaintext' escapes markdown characters, 'raw' shows the comment text verbatim including comment markers. */
+  docCommentFormat?: "plaintext" | "markdown" | "raw"
+}
+
 export interface Config__IndexConfig {
   /** Directories to index */
   dirs?: string[]
@@ -51,6 +64,10 @@ export interface Config__IndexConfig {
 export interface Config__InlayHints {
   /** Hints for port types */
   portTypes?: boolean
+  /** Hints for inferred assignment pattern types */
+  assignmentPatternTypes?: boolean
+  /** Hints for active instance parameter and localparam values */
+  activeParameterValues?: boolean
   /** Hints for names of ordered ports and params */
   orderedInstanceNames?: boolean
   /** Hints for port names in wildcard (.*) ports */

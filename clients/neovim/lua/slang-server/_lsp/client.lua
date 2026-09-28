@@ -1,3 +1,5 @@
+local capabilities = require("slang-server._lsp.capabilities")
+
 local M = {}
 
 -- LSP commands
@@ -9,35 +11,34 @@ local lsp_execute = function(bufnr, params, handlers)
 
    local on_failure = handlers.on_failure or function() end
 
-   local client_found = false
-   for _, client in pairs(vim.lsp.get_clients({ bufnr = bufnr })) do
-      if client.server_capabilities.executeCommandProvider then
-         for _, value in ipairs(client.server_capabilities.executeCommandProvider.commands) do
-            if command == value then
-               client_found = true
-               break
-            end
-         end
-      end
-   end
-
-   if not client_found then
-      on_failure("No client found")
+   local ok, err = capabilities.command_supported(bufnr, command)
+   if not ok then
+      on_failure(err)
       return
    end
 
-   local handle = function(resp)
-      for _, client_resp in pairs(resp) do
-         if client_resp.error then
-            on_failure(client_resp.error.message)
-            return
-         else
-            handlers.on_success(client_resp.result)
-         end
-      end
+   local lsp_client = capabilities.get_client(bufnr)
+   if not lsp_client then
+      on_failure("slang-server: no slang-server LSP client attached")
+      return
    end
 
-   vim.lsp.buf_request_all(bufnr, "workspace/executeCommand", params, handle)
+   local completed = false
+   local sent = lsp_client:request("workspace/executeCommand", params, function(request_err, result)
+      if completed then
+         return
+      end
+      completed = true
+      if request_err then
+         on_failure(request_err.message)
+      else
+         handlers.on_success(result)
+      end
+   end, bufnr)
+   if sent == false and not completed then
+      completed = true
+      on_failure("slang-server: failed to send workspace/executeCommand request")
+   end
 end
 
 ---@param bufnr integer
@@ -82,6 +83,29 @@ end
 
 ---@param bufnr integer
 ---@param handlers RespHandlers
+---@param params { hierPath: string, takeFocus: boolean? }
+M.showHierLocation = function(bufnr, handlers, params)
+   lsp_execute(bufnr, {
+      command = "slang.showHierLocation",
+      arguments = { {
+         hierPath = params.hierPath,
+         takeFocus = params.takeFocus or false,
+      } },
+   }, handlers)
+end
+
+---@param bufnr integer
+---@param handlers RespHandlers
+---@param params { query: string }
+M.searchHierarchy = function(bufnr, handlers, params)
+   lsp_execute(bufnr, {
+      command = "slang.searchHierarchy",
+      arguments = { params.query },
+   }, handlers)
+end
+
+---@param bufnr integer
+---@param handlers RespHandlers
 M.getScopesByModule = function(bufnr, handlers)
    lsp_execute(bufnr, {
       command = "slang.getScopesByModule",
@@ -96,6 +120,16 @@ M.getInstancesOfModule = function(bufnr, handlers, params)
    lsp_execute(bufnr, {
       command = "slang.getInstancesOfModule",
       arguments = { params.moduleName },
+   }, handlers)
+end
+
+---@param bufnr integer
+---@param handlers RespHandlers
+---@param params { hierPath: string }
+M.setActiveInstance = function(bufnr, handlers, params)
+   lsp_execute(bufnr, {
+      command = "slang.setActiveInstance",
+      arguments = { params.hierPath },
    }, handlers)
 end
 

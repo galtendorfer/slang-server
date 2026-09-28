@@ -15,10 +15,10 @@ on:
         type: string
         default: ''
   push:
-    branches: [main]
+    branches: [main, ci-test]
     paths-ignore:
       - 'docs/**'
-      - 'clients/**'
+      - 'clients/vscode/**'
       - '*.md'
       - 'mkdocs.yaml'
       - 'pyproject.toml'
@@ -26,61 +26,138 @@ on:
   pull_request:
     paths-ignore:
       - 'docs/**'
-      - 'clients/**'
+      - 'clients/vscode/**'
       - '*.md'
       - 'mkdocs.yaml'
       - 'pyproject.toml'
       - 'uv.lock'
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - preset: clang-release
-            os: ubuntu-latest
-            container: rockylinux:8
-            artifact_name: slang-server-linux-x64-clang
-            extra_flags: -DCMAKE_CXX_COMPILER=clang++
-          - preset: gcc-release
-            os: ubuntu-latest
-            container: rockylinux:8
-            artifact_name: slang-server-linux-x64-gcc
-            extra_flags: -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/g++
-          - preset: macos-release
+          # Canonical Linux release builds: built in manylinux_2_28 (glibc 2.28)
+          # so binaries run on older distros (RHEL/Rocky/Alma 8, Debian 10, etc.).
+          - name: linux-x64
+            preset: gcc-release
+            os: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            cmake_args: -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+          - name: linux-arm64
+            preset: gcc-release
+            os: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64
+            cmake_args: -DCMAKE_CXX_COMPILER=/opt/rh/gcc-toolset-14/root/usr/bin/g++
+          # Disabled due to download timeouts. Revisit when https://github.com/jirutka/setup-alpine/issues/32 is resolved
+          # - name: linux-x64-musl
+          #   preset: gcc-release
+          #   os: ubuntu-24.04
+          #   alpine: true
+          #   cmake_args: -DCMAKE_CXX_COMPILER=g++
+          #   skip_pytests: true
+          #   skip_neovim_tests: true
+          #   shell: 'alpine.sh {0}'
+          # Dev-only Linux builds for additional compiler/host coverage.
+          # OS is in the name to distinguish from the canonical release builds.
+          - name: linux-x64-ubuntu-24.04-clang
+            preset: clang-release
+            os: ubuntu-24.04
+            skip_upload: true
+          - name: linux-arm64-ubuntu-24.04-clang
+            preset: clang-release
+            os: ubuntu-24.04-arm
+            skip_upload: true
+          - name: linux-x64-ubuntu-24.04-clang-debug
+            preset: clang-debug
+            os: ubuntu-24.04
+            skip_pytests: true
+            skip_neovim_tests: true
+            skip_upload: true
+          - name: linux-x64-ubuntu-24.04-gcc
+            preset: gcc-release
+            os: ubuntu-24.04
+            skip_upload: true
+          # gcc-release pins g++-14; keep explicit GCC 13 coverage (#407).
+          - name: linux-x64-ubuntu-24.04-gcc-13
+            preset: gcc-release
+            os: ubuntu-24.04
+            cmake_args: -DCMAKE_CXX_COMPILER=g++-13
+            skip_pytests: true
+            skip_neovim_tests: true
+            skip_upload: true
+          - name: macos
+            preset: macos-release
             os: macos-15
-            artifact_name: slang-server-macos
-            extra_flags: -DCMAKE_CXX_COMPILER=clang++
-          - preset: win64-release
+          - name: windows-x64
+            preset: win64-release
             os: windows-latest
-            artifact_name: slang-server-windows-x64
+          - name: windows-arm64
+            preset: winarm64-release
+            os: windows-11-arm
 
     runs-on: ${{ matrix.os }}
     container: ${{ matrix.container }}
+    defaults:
+      run:
+        shell: ${{ matrix.shell || (startsWith(matrix.os, 'windows') && 'pwsh' || 'bash') }}
+    env:
+      SLANG_SERVER_ARTIFACT_NAME: slang-server-${{ matrix.name }}
     steps:
-      - name: Install dependencies (Rocky Linux 8)
-        if: matrix.container == 'rockylinux:8'
+      - name: Install dependencies (manylinux_2_28)
+        if: startsWith(matrix.container, 'quay.io/pypa/manylinux_2_28')
         run: |
-          dnf -y update
-          dnf -y install 'dnf-command(config-manager)'
-          dnf config-manager --set-enabled powertools
-          dnf -y install epel-release
-          dnf -y install gcc-c++ clang cmake git make gcc-toolset-14-libatomic-devel
+          # manylinux_2_28 already provides gcc-toolset-14, cmake, make, git, python.
+          # Only need gcc-toolset-14-libatomic-devel for the atomic intrinsics.
+          dnf -y install gcc-toolset-14-libatomic-devel
+          cmake --version
+      - name: Install Clang 21 (Ubuntu)
+        if: startsWith(matrix.preset, 'clang-')
+        run: |
+          wget -O - https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
+          sudo add-apt-repository "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main"
+          sudo apt-get update
+          sudo apt-get install -y clang-21
+      - name: Install GCC 13 (Ubuntu)
+        if: contains(matrix.name, 'gcc-13')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13
       - uses: actions/checkout@v6
         with:
           ref: ${{ inputs.ref || github.ref }}
           submodules: true
           fetch-depth: 0
+      - name: Set up Alpine Linux
+        if: matrix.alpine == true
+        uses: jirutka/setup-alpine@v1
+        with:
+          arch: x86_64
+          branch: latest-stable
+          packages: >
+            bash
+            build-base
+            cmake
+            git
+            make
+            python3
       - uses: ilammy/msvc-dev-cmd@v1
         if: runner.os == 'Windows'
+        with:
+          arch: ${{ runner.arch == 'ARM64' && 'arm64' || 'x64' }}
       - uses: maxim-lobanov/setup-xcode@v1
         if: runner.os == 'macOS'
         with:
           xcode-version: 'latest'
 
       - name: Configure
-        run: cmake --preset ${{ matrix.preset }} -DSLANG_CI_BUILD=ON ${{ matrix.extra_flags }}
+        run: cmake --preset ${{ matrix.preset }} -DSLANG_CI_BUILD=ON ${{ matrix.cmake_args }}
 
       - name: Build
         run: cmake --build build/${{ matrix.preset }} -j8
@@ -89,10 +166,11 @@ jobs:
         run: ctest --test-dir build/${{ matrix.preset }} --output-on-failure --no-tests=error -j8
 
       - name: Set up uv
+        if: matrix.skip_pytests != true
         uses: astral-sh/setup-uv@v6
 
       - name: Run pytest (Linux/macOS)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.skip_pytests != true
         run: |
           uv venv
           source .venv/bin/activate
@@ -100,7 +178,7 @@ jobs:
           pytest tests/system/ --binary build/${{ matrix.preset }}/bin/slang-server
 
       - name: Run pytest (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && matrix.skip_pytests != true
         run: |
           uv venv
           .venv\Scripts\activate
@@ -110,43 +188,33 @@ jobs:
       - name: Run Neovim plugin tests
         # This should work on Windows as well, but there's some linker error
         # that I don't feel like debugging via GH
-        # Also skip rockylinux since the container makes action-setup-vim sad
-        # This can easily be fixed by copying instead of moving the neovim install,
-        # unfortunately that uncovers the fact that the neovim builds from that
-        # GH action require a newer GLIBC version than rockylinux provides.
-        # Not going down that rabbit hole right now
-        if: runner.os != 'Windows' && matrix.container == ''
+        # Also skip when running inside a container (manylinux_2_28): the
+        # prebuilt nvim binaries from nvim-busted-action require a newer GLIBC
+        # than the container provides. The dev-only Ubuntu jobs cover this.
+        if: runner.os != 'Windows' && matrix.container == '' && matrix.skip_neovim_tests != true
         uses: nvim-neorocks/nvim-busted-action@v1
         env:
           SLANG_SERVER_BIN: ../../build/${{ matrix.preset }}/bin/slang-server
         with:
           luarocks_args: 'clients/neovim/slang-server.nvim-scm-1.rockspec --test-type busted -- -C clients/neovim/'
 
-      # Artifact creation for releases
-      - name: Strip binary (Linux)
-        if: inputs.upload_artifacts && runner.os == 'Linux'
-        run: strip build/${{ matrix.preset }}/bin/slang-server
-
-      - name: Create artifact directory
-        if: inputs.upload_artifacts
-        run: mkdir -p release-artifacts
-
-      - name: Copy binary (Linux/macOS)
-        if: inputs.upload_artifacts && runner.os != 'Windows'
-        run: |
-          cp build/${{ matrix.preset }}/bin/slang-server release-artifacts/slang-server
-          chmod +x release-artifacts/slang-server
-
-      - name: Copy binary (Windows)
-        if: inputs.upload_artifacts && runner.os == 'Windows'
-        shell: bash
-        run: cp build/${{ matrix.preset }}/bin/slang-server.exe release-artifacts/slang-server.exe
-
-      - name: Create README
-        if: inputs.upload_artifacts
+      - name: Package release artifact
+        if: inputs.upload_artifacts && !matrix.skip_upload
         shell: bash
         run: |
-          cat > release-artifacts/README.txt << 'EOF'
+          mkdir -p release-artifacts
+
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            cp build/${{ matrix.preset }}/bin/slang-server.exe release-artifacts/slang-server.exe
+          else
+            cp build/${{ matrix.preset }}/bin/slang-server release-artifacts/slang-server
+            chmod +x release-artifacts/slang-server
+            if [[ "${RUNNER_OS}" == "Linux" ]]; then
+              strip release-artifacts/slang-server
+            fi
+          fi
+
+          cat > release-artifacts/README.txt <<EOF
           Slang Server - SystemVerilog Language Server
 
           This is a pre-built binary of slang-server.
@@ -159,31 +227,29 @@ jobs:
           For more information, visit:
           https://github.com/hudson-trading/slang-server
 
-          Platform: ${{ matrix.artifact_name }}
+          Platform: ${{ env.SLANG_SERVER_ARTIFACT_NAME }}
           Build date: $(date -u +%Y-%m-%d)
           EOF
 
-      - name: Create tarball (Linux/macOS)
-        if: inputs.upload_artifacts && runner.os != 'Windows'
-        run: |
-          cd release-artifacts
-          tar -czf ../${{ matrix.artifact_name }}.tar.gz *
-          cd ..
-
-      - name: Create zip (Windows)
-        if: inputs.upload_artifacts && runner.os == 'Windows'
-        shell: bash
-        run: |
-          cd release-artifacts
-          7z a ../${{ matrix.artifact_name }}.zip *
-          cd ..
+          if [[ "${RUNNER_OS}" == "Windows" ]]; then
+            (cd release-artifacts && 7z a ../${{ env.SLANG_SERVER_ARTIFACT_NAME }}.zip *)
+          else
+            tar -czf ${{ env.SLANG_SERVER_ARTIFACT_NAME }}.tar.gz -C release-artifacts .
+            if [[ "${{ matrix.name }}" == "linux-x64" ]]; then
+              cp ${{ env.SLANG_SERVER_ARTIFACT_NAME }}.tar.gz slang-server-old-linux-x64-gcc.tar.gz
+            elif [[ "${{ matrix.name }}" == "linux-arm64" ]]; then
+              cp ${{ env.SLANG_SERVER_ARTIFACT_NAME }}.tar.gz slang-server-linux-arm64-clang.tar.gz
+            fi
+          fi
 
       - name: Upload artifact
-        if: inputs.upload_artifacts
+        if: inputs.upload_artifacts && !matrix.skip_upload
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
+          name: ${{ env.SLANG_SERVER_ARTIFACT_NAME }}
           path: |
-            ${{ matrix.artifact_name }}.tar.gz
-            ${{ matrix.artifact_name }}.zip
+            ${{ env.SLANG_SERVER_ARTIFACT_NAME }}.tar.gz
+            ${{ env.SLANG_SERVER_ARTIFACT_NAME }}.zip
+            slang-server-old-linux-x64-gcc.tar.gz
+            slang-server-linux-arm64-clang.tar.gz
           retention-days: 7

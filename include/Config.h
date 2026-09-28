@@ -6,7 +6,9 @@
 // SPDX-License-Identifier: MIT
 //------------------------------------------------------------------------------
 #pragma once
+#include "rfl/Deprecated.hpp"
 #include "rfl/Description.hpp"
+#include "rfl/config.hpp"
 #include <optional>
 #include <rfl/Result.hpp>
 #include <rfl/Skip.hpp>
@@ -32,9 +34,10 @@ struct Config {
     rfl::Description<"Flags to pass to slang", std::string> flags;
 
     // Legacy indexing globs, kept for backwards compatibility
-    rfl::Description<"Deprecated: use 'index' instead. Globs of what to index. By default will "
-                     "index all sv and svh files in the workspace.",
-                     std::vector<std::string>>
+    rfl::Deprecated<"Use 'index' instead.",
+                    "Globs of what to index. By default will "
+                    "index all sv and svh files in the workspace.",
+                    std::vector<std::string>>
         indexGlobs;
 
     struct IndexConfig {
@@ -66,8 +69,7 @@ struct Config {
         }
     }
 
-    rfl::Description<"Deprecated: use 'index' instead. Directories to exclude",
-                     std::vector<std::string>>
+    rfl::Deprecated<"Use 'index' instead.", "Directories to exclude", std::vector<std::string>>
         excludeDirs;
     rfl::Description<"Thread count to use for indexing", int> indexingThreads = 0;
     rfl::Description<"Build file to use", std::optional<std::string>> build;
@@ -87,8 +89,23 @@ struct Config {
                      std::optional<std::string>>
         wcpCommand;
 
+    struct HoverConfig {
+        enum class DocCommentFormat { plaintext, markdown, raw };
+        rfl::Description<"How to render leading doc comments in hovers: 'markdown' renders as "
+                         "markdown, 'plaintext' escapes markdown characters, 'raw' shows the "
+                         "comment text verbatim including comment markers.",
+                         DocCommentFormat>
+            docCommentFormat = DocCommentFormat::markdown;
+    };
+
+    rfl::Description<"Hover behavior settings", HoverConfig> hovers = HoverConfig{};
+
     struct InlayHints {
         rfl::Description<"Hints for port types", bool> portTypes = false;
+        rfl::Description<"Hints for inferred assignment pattern types", bool>
+            assignmentPatternTypes = true;
+        rfl::Description<"Hints for active instance parameter and localparam values", bool>
+            activeParameterValues = true;
         rfl::Description<"Hints for names of ordered ports and params", bool> orderedInstanceNames =
             true;
         rfl::Description<"Hints for port names in wildcard (.*) ports", bool> wildcardNames = true;
@@ -135,4 +152,22 @@ struct Config {
 
     /// Per-file flags with correct precedence. Skipped during serialization.
     rfl::Skip<std::vector<FlagSource>> flagsByFile;
+};
+
+template<>
+struct rfl::config::enum_descriptions<Config::HoverConfig::DocCommentFormat> {
+    static constexpr bool has_descriptions = true;
+    static constexpr std::string_view get(Config::HoverConfig::DocCommentFormat value) {
+        switch (value) {
+            case Config::HoverConfig::DocCommentFormat::plaintext:
+                return "Strip comment markers and escape markdown characters so the text renders "
+                       "as-is.";
+            case Config::HoverConfig::DocCommentFormat::markdown:
+                return "Strip comment markers and render the contents as markdown.";
+            case Config::HoverConfig::DocCommentFormat::raw:
+                return "Show the comment text verbatim, including comment markers, in a code "
+                       "block.";
+        }
+        return "";
+    }
 };

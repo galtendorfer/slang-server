@@ -8,6 +8,7 @@
 #pragma once
 
 #include "Config.h"
+#include "ast/ActiveDesignContext.h"
 #include "document/SymbolIndexer.h"
 #include "document/SymbolTreeVisitor.h"
 #include "document/SyntaxIndexer.h"
@@ -15,9 +16,12 @@
 #include "util/Markdown.h"
 #include <memory>
 #include <optional>
+#include <span>
+#include <string>
 #include <string_view>
 #include <vector>
 
+#include "slang/analysis/AnalysisManager.h"
 #include "slang/analysis/AnalysisOptions.h"
 #include "slang/ast/ASTContext.h"
 #include "slang/ast/Compilation.h"
@@ -33,29 +37,10 @@
 #include "slang/util/Bag.h"
 namespace server {
 using namespace slang;
-struct DefinitionInfo {
-    // The syntax that the token refers to
-    const slang::syntax::SyntaxNode* node;
-    // The exact name id in the syntax node, or the first token in the syntax if it wasn't found
-    slang::parsing::Token nameToken;
-    // Optional original source range; exists if it's behind a macro expansion
-    slang::SourceRange macroUsageRange;
-    // The symbol this token refers to (if any)
-    const slang::ast::Symbol* symbol;
-    // Expanded text for macro usages (what the macro expands to at this call site)
-    std::string macroExpansionText;
-    // For command-line defines: the config/build file that defined this directive
-    std::string defineSourceFile;
-
-    bool operator==(const DefinitionInfo& other) const {
-        return node == other.node && nameToken.location() == other.nameToken.location() &&
-               macroUsageRange == other.macroUsageRange && symbol == other.symbol;
-    }
-
-    bool operator!=(const DefinitionInfo& other) const { return !(*this == other); }
-};
 
 class DocumentHandle;
+class ServerCompilation;
+
 class ShallowAnalysis {
 public:
     /// @brief Constructs a DocumentAnalysis instance with syntax and symbol indexing
@@ -70,10 +55,13 @@ public:
     /// @param trees Additional syntax trees that this document depends on
     ShallowAnalysis(SourceManager& sourceManager, slang::BufferID buffer,
                     std::shared_ptr<slang::syntax::SyntaxTree> tree, slang::Bag options,
-                    const std::vector<std::shared_ptr<slang::syntax::SyntaxTree>>& allTrees = {});
+                    const std::vector<std::shared_ptr<slang::syntax::SyntaxTree>>& allTrees = {},
+                    const ServerCompilation* design = nullptr);
 
     /// @brief Retrieves document symbols for LSP outline view, called right after open
-    /// @return Vector of LSP document symbols representing the document structure
+    /// @return Tree of LSP document symbols representing the document CST structure
+    /// This also provides range info for "sticky scroll", where the open scopes stick at the top of
+    /// the editor to provide context
     std::vector<lsp::DocumentSymbol> getDocSymbols();
 
     /// @brief Gets document links for include directives, called right after open
@@ -121,6 +109,34 @@ public:
 
     const std::unique_ptr<slang::ast::Compilation>& getCompilation() const { return m_compilation; }
 
+    /// @brief Gets semantic diagnostics after shallowly elaborating edited-file definitions.
+    const Diagnostics& getSemanticDiagnostics();
+
+    /// @brief Ensures the shallow compilation has been analyzed and returns the slang
+    /// `AnalysisManager`. Returns nullptr if analysis could not be run, for example no top
+    /// instances.
+    const slang::analysis::AnalysisManager* getAnalysisManager();
+
+    /// @brief Gets a list of drivers for a given value symbol
+    std::vector<const slang::analysis::ValueDriver*> getDrivers(
+        const slang::ast::ValueSymbol& symbol);
+
+    /// @brief Return the corresponding symbol from the selected full-design instance, if any.
+    const slang::ast::Symbol* getDesignSymbol(const slang::ast::Symbol& shallowSymbol) const;
+
+    /// Resolve a module type token using the active design instead of indexed duplicates.
+    /// The returned symbol is owned by this analysis's retained design snapshot.
+    const slang::ast::Symbol* getActiveInstantiationDefinitionAtToken(
+        const slang::parsing::Token* token) const;
+
+    /// Return the full-design instance referenced by a module, named parameter, or named port
+    /// token at an instantiation site.
+    std::optional<std::string> getDesignInstancePathAtToken(
+        const slang::parsing::Token* token) const;
+
+    const InterfaceConnection* getActiveInterfaceConnection(
+        const slang::ast::InterfacePortSymbol& port) const;
+
     /// @brief Gets the source manager for this analysis
     SourceManager& getSourceManager() const { return m_sourceManager; }
 
@@ -130,6 +146,15 @@ public:
 
     /// @brief Gets the AST symbol that a declared token refers to, if any
     const slang::ast::Symbol* getSymbolAtToken(const slang::parsing::Token* node) const;
+
+    /// @brief Gets all AST symbols that a token refers to. A source token can denote multiple
+    /// elaborated symbols, or both sides of an implicit connection.
+    slang::SmallVector<const slang::ast::Symbol*, 2> getSymbolsAtToken(
+        const slang::parsing::Token* node) const;
+
+    /// @brief Gets the implicit per-iteration parameters for a loop-header genvar token.
+    std::span<const slang::ast::ParameterSymbol* const> getGenvarIterationParametersAtToken(
+        const slang::parsing::Token* node) const;
 
     /// Syntax finder for location->syntax mapping
     SyntaxIndexer syntaxes;
@@ -148,7 +173,13 @@ public:
     /// @brief Gets the appropriate scope from a symbol for member access traversal
     /// @param symbol The symbol to get the scope from
     /// @return Pointer to the scope, or nullptr if the symbol doesn't have an accessible scope
-    static const slang::ast::Scope* getScopeFromSym(const slang::ast::Symbol* symbol);
+    const slang::ast::Scope* getScopeFromSym(const slang::ast::Symbol* symbol) const;
+
+    /// Gets the target struct scope when the location is an assignment pattern key.
+    const slang::ast::Scope* getAssignmentPatternKeyScope(slang::SourceLocation loc) const;
+
+    /// Gets the target struct scope at a possible assignment pattern key completion site.
+    const slang::ast::Scope* getAssignmentPatternCompletionScope(slang::SourceLocation loc) const;
 
     std::vector<lsp::InlayHint> getInlayHints(lsp::Range range,
                                               const struct Config::InlayHints& config);
@@ -181,6 +212,17 @@ private:
     /// Compilation context for symbol resolution
     std::unique_ptr<slang::ast::Compilation> m_compilation;
 
+    /// Information from the active design when a top level or filelist is set
+    std::optional<ActiveDesignContext> m_activeDesign;
+
+    /// Analysis manager for running driver analysis (multi-driven, unused, etc)
+    std::unique_ptr<slang::analysis::AnalysisManager> m_driverAnalysis = nullptr;
+
+    /// Cached diagnostics from the latest analysis run, if available
+    std::optional<Diagnostics> m_cachedAnalysisDiags;
+
+    bool m_editedDefinitionsElaborated = false;
+
     /// Analysis options for driver analysis (numThreads=1 to avoid persistent threads)
     slang::analysis::AnalysisOptions m_analysisOptions;
 
@@ -192,6 +234,28 @@ private:
     /// Symbol indexer for syntax->symbol mappings of definitions; Used for lookups
     SymbolIndexer m_symbolIndexer;
 
+    struct GenvarElaboration {
+        const slang::ast::GenvarSymbol* source = nullptr;
+        slang::SmallVector<const slang::ast::ParameterSymbol*> parameters;
+        bool initialized = false;
+    };
+    mutable slang::flat_hash_map<const slang::syntax::LoopGenerateSyntax*, GenvarElaboration>
+        m_genvarElaborations;
+
+    mutable slang::flat_hash_map<const slang::ast::DefinitionSymbol*, const slang::ast::Scope*>
+        m_interfaceFallbackScopes;
+
+    const GenvarElaboration* getGenvarElaborationAtToken(const slang::parsing::Token* node) const;
+
+    const slang::ast::Symbol* getAssignmentPatternTargetSymbol(
+        const slang::syntax::AssignmentPatternExpressionSyntax& pattern) const;
+
+    const slang::ast::Scope* getAssignmentPatternTargetScope(
+        const slang::syntax::AssignmentPatternExpressionSyntax& pattern) const;
+
+    const slang::ast::Scope* getAssignmentPatternScopeAt(slang::SourceLocation loc,
+                                                         bool allowIncompleteKey) const;
+
     /// @brief Helper method to check if a token is positioned over a selector
     bool isOverSelector(const slang::parsing::Token* node,
                         const slang::ast::LookupResult& result) const;
@@ -199,11 +263,9 @@ private:
     /// @brief Helper method to handle lookup for scoped names (e.g., pkg::identifier)
     /// @param nameSyntax The name syntax to look up
     /// @param context The AST context for the lookup
-    /// @param scope The scope to search in
     /// @return Pointer to the found symbol, or nullptr if not found
     const slang::ast::Symbol* handleScopedNameLookup(const slang::syntax::NameSyntax* nameSyntax,
-                                                     const slang::ast::ASTContext& context,
-                                                     const slang::ast::Scope* scope) const;
+                                                     const slang::ast::ASTContext& context) const;
 
     /// @brief Helper method to handle symbol lookup for interface port headers
     /// @param node The token being queried

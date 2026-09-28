@@ -135,6 +135,34 @@ All configuration options are optional and have sensible defaults. In VSCode, th
 
 ---
 
+### `hovers`
+
+:   **Type:** `HoverConfig`
+
+    ```typescript
+    interface HoverConfig {
+      /** How leading doc comments are rendered in hovers */
+      docCommentFormat?: "plaintext" | "markdown" | "raw"  // default: "markdown"
+    }
+    ```
+
+    Controls how hover popups present leading comments
+
+    - **`docCommentFormat`**: How to render the leading doc comment of the hovered symbol.
+        - `"markdown"` (default): strip `//` / `/* */` markers and render the contents as markdown, so things like `**bold**`, links, and lists render in the hover.
+        - `"plaintext"`: strip markers but escape markdown characters so the comment text appears literally — useful when comments contain characters like `*`, `_`, or `<tag/>` that you don't want rendered.
+        - `"raw"`: don't strip anything — show the comment text and the declaration together in a single SystemVerilog code block, exactly as they appear in source. Useful when comments contain code-like content (e.g. timing diagrams, ASCII tables) that should not be reflowed by a markdown renderer.
+
+    **Example:**
+
+    ```json
+    "hovers": {
+      "docCommentFormat": "plaintext"
+    }
+    ```
+
+---
+
 ### `inlayHints`
 
 :   **Type:** `InlayHints`
@@ -143,6 +171,10 @@ All configuration options are optional and have sensible defaults. In VSCode, th
     interface InlayHints {
       /** Hints for port types */
       portTypes?: boolean           // default: false
+      /** Hints for inferred assignment pattern types */
+      assignmentPatternTypes?: boolean // default: true
+      /** Hints for active instance parameter and localparam values */
+      activeParameterValues?: boolean  // default: true
       /** Hints for names of ordered ports and params */
       orderedInstanceNames?: boolean // default: true
       /** Hints for port names in wildcard (.*) ports */
@@ -157,6 +189,8 @@ All configuration options are optional and have sensible defaults. In VSCode, th
     Controls inline hints displayed in the editor for things like ordered arguments, wildcard ports, and others.
 
     - **`portTypes`**: Show type hints on ports. Off by default.
+    - **`assignmentPatternTypes`**: Show the inferred struct or union type before untyped assignment patterns.
+    - **`activeParameterValues`**: Show parameter and localparam values from the active instance.
     - **`orderedInstanceNames`**: Show parameter/port name hints on ordered (positional) instance connections.
     - **`wildcardNames`**: Show port name hints on wildcard (`.*`) connections.
     - **`funcArgNames`**: Show argument name hints on function calls. Set to `0` to disable, or `N` to only show hints for calls with N or more arguments.

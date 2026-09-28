@@ -12,9 +12,10 @@
 #include "completions/CompletionContext.h"
 #include "document/SlangDoc.h"
 #include "lsp/LspTypes.h"
-#include <filesystem>
+#include "lsp/RequestContext.h"
 #include <memory>
-#include <optional>
+#include <string>
+#include <vector>
 
 #include "slang/text/SourceLocation.h"
 #include "slang/util/Bag.h"
@@ -25,36 +26,33 @@ class ServerDriver;
 
 class CompletionDispatch {
 private:
+    friend class CompletionQuery;
+
     // May need to retrieve additional documents
     ServerDriver& m_driver;
     const Indexer& m_indexer;
     SourceManager& m_sourceManager;
     slang::Bag& m_options;
 
-    /// Last open document, used to store context for completion resolution
-    std::shared_ptr<SlangDoc> m_lastDoc;
-
-    // name of last scope
-    std::string m_lastScope;
-
 public:
+    bool resolveEdits = false;
+
     CompletionDispatch(ServerDriver& driver, const Indexer& indexer, SourceManager& sourceManager,
                        slang::Bag& options);
 
-    void getInvokedCompletions(std::vector<lsp::CompletionItem>& results,
-                               std::shared_ptr<SlangDoc> doc, const SourceLocation& loc);
+    /// Top-level completion entry point. The semantic target is derived from source around the
+    /// cursor; trigger characters only control when clients invoke this method.
+    void getCompletions(std::vector<lsp::CompletionItem>& results, std::shared_ptr<SlangDoc> doc,
+                        const CompletionContext& ctx);
 
-    void getTriggerCompletions(char triggerChar, char prevChar, std::shared_ptr<SlangDoc> doc,
-                               slang::SourceLocation loc,
-                               std::vector<lsp::CompletionItem>& results);
-
-    void resolveModuleCompletion(lsp::CompletionItem& item,
-                                 std::optional<std::filesystem::path> modulePath = std::nullopt,
-                                 bool excludeName = false);
-
-    void resolveMacroCompletion(lsp::CompletionItem& item);
-
-    void getCompletionItemResolve(lsp::CompletionItem& item);
+    void getCompletionItemResolve(lsp::CompletionItem& item, const lsp::RequestContext& ctx);
 };
+
+namespace completions {
+
+/// Characters that clients should use to trigger completion requests.
+const std::vector<std::string>& completionTriggerCharacters();
+
+} // namespace completions
 
 } // namespace server

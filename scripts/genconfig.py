@@ -95,11 +95,43 @@ def generate_schema(build_dir: Path, schema_path: Path) -> None:
     schema_path.write_text(result.stdout)
 
 
+def jsdoc_from_schema(s: dict, indent: str = "") -> list[str]:
+    """Generate JSDoc lines from schema metadata."""
+    desc = s.get("description", "")
+    deprecated = s.get("deprecated", False)
+    deprecated_message = s.get("deprecated_message", "")
+
+    if not deprecated:
+        if desc:
+            return [f"{indent}/** {desc} */"]
+        return []
+
+    lines = []
+
+    if deprecated_message:
+        lines.append(f"@deprecated {deprecated_message}")
+    else:
+        lines.append("@deprecated")
+
+    if desc:
+        lines.append(desc)
+
+    out = [f"{indent}/**"]
+    for line in lines:
+        out.append(f"{indent} * {line}")
+    out.append(f"{indent} */")
+    return out
+
+
 def type_from_schema(s: dict) -> str:
     """Convert JSON schema type to TypeScript type."""
     if "$ref" in s:
         return s["$ref"].split("/")[-1]
-
+    if "const" in s:
+        return json.dumps(s["const"])
+    if "enum" in s:
+        values = s["enum"]
+        return " | ".join(json.dumps(v) for v in values)
     if s.get("type") == "string":
         return "string"
     if s.get("type") in ("integer", "number"):
@@ -115,14 +147,16 @@ def type_from_schema(s: dict) -> str:
 
     if "anyOf" in s:
         return " | ".join(type_from_schema(t) for t in s["anyOf"])
+    if "oneOf" in s:
+        return " | ".join(type_from_schema(t) for t in s["oneOf"])
 
     if s.get("type") == "object" and "properties" in s:
         props = []
         for key, val in s["properties"].items():
             prop_type = type_from_schema(val)
-            desc = val.get("description", "")
+            desc = jsdoc_from_schema(val, indent="  ")
             if desc:
-                props.append(f"\n  /** {desc} */")
+                props.append("\n" + "\n".join(desc))
             props.append(f'\n  "{key}"?: {prop_type}')
         return "{" + "".join(props) + "\n}"
 
@@ -134,13 +168,14 @@ def generate_interface(name: str, schema_def: dict) -> str:
     props = []
     for key, val in schema_def.get("properties", {}).items():
         prop_type = type_from_schema(val)
-        desc = val.get("description", "")
+        desc = jsdoc_from_schema(val, indent="  ")
         if desc:
-            props.append(f"/** {desc} */")
-        props.append(f"{key}?: {prop_type}")
+            props.extend(desc)
 
-    props_str = "\n  ".join(props)
-    return f"export interface {name} {{\n  {props_str}\n}}"
+        props.append(f"  {key}?: {prop_type}")
+
+    props_str = "\n".join(props)
+    return f"export interface {name} {{\n{props_str}\n}}"
 
 
 def generate_typescript(schema_path: Path, ts_path: Path) -> None:

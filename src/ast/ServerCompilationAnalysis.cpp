@@ -18,30 +18,29 @@
 namespace server {
 
 ServerCompilationAnalysis::ServerCompilationAnalysis(
-    std::vector<std::shared_ptr<SlangDoc>>& documents, Bag& options, SourceManager& sourceManager) :
+    const std::unordered_map<std::string, std::shared_ptr<SlangDoc>>& documents, Bag& options,
+    SourceManager& sourceManager) :
     compilation(options),
     m_analysisOptions(options.getOrDefault<slang::analysis::AnalysisOptions>()) {
-    // Collect all buffer IDs from all syntax trees
-    {
-        std::vector<BufferID> allBuffers;
-        std::unordered_set<BufferID> includedBuffers;
-        for (auto& doc : documents) {
-            auto tree = doc->getSyntaxTree();
-            compilation.addSyntaxTree(tree);
-            for (auto bufId : tree->getSourceBufferIds()) {
-                allBuffers.push_back(bufId);
-            }
-            for (auto inc : tree->getIncludeDirectives()) {
-                includedBuffers.insert(inc.buffer.id);
+    std::vector<BufferID> bufferIds;
+    std::unordered_set<BufferID> seenBuffers;
+
+    for (auto& [_, doc] : documents) {
+        auto tree = doc->getSyntaxTree();
+        compilation.addSyntaxTree(tree);
+
+        for (auto bufferId : tree->getSourceBufferIds()) {
+            if (seenBuffers.insert(bufferId).second) {
+                bufferIds.push_back(bufferId);
+                auto path = sourceManager.getFullPath(bufferId);
+                if (!path.empty())
+                    sourcePaths.emplace(path.string());
             }
         }
-        // add to vec
-        for (auto bufId : includedBuffers) {
-            allBuffers.push_back(bufId);
-        }
-        // Retain buffer data to prevent deallocation while this compilation exists
-        m_retainedBuffers = sourceManager.retainBuffers(allBuffers);
     }
+
+    // Retain buffer data to prevent deallocation while this compilation exists
+    m_retainedBuffers = sourceManager.retainBuffers(bufferIds);
 
     // reset and rebuild indexed info
     auto& root = compilation.getRoot();
@@ -49,6 +48,16 @@ ServerCompilationAnalysis::ServerCompilationAnalysis(
 
     // symbol references are not indexed until cone tracing is requested
     m_references.reset();
+}
+
+slang::analysis::AnalysisManager& ServerCompilationAnalysis::getAnalysisManager() {
+    if (!m_driverAnalysis) {
+        m_driverAnalysis = std::make_unique<slang::analysis::AnalysisManager>(m_analysisOptions);
+        compilation.freeze();
+        m_driverAnalysis->analyze(compilation);
+        compilation.unfreeze();
+    }
+    return *m_driverAnalysis;
 }
 
 void ServerCompilationAnalysis::issueDiagnosticsTo(slang::DiagnosticEngine& diagEngine) {
@@ -59,14 +68,16 @@ void ServerCompilationAnalysis::issueDiagnosticsTo(slang::DiagnosticEngine& diag
 
     // Driver analysis diagnostics (multi-driven, unused, etc)
     // Use stored options with numThreads=1 to avoid persistent thread pool
-    slang::analysis::AnalysisManager driverAnalysis(m_analysisOptions);
-    compilation.freeze();
-    driverAnalysis.analyze(compilation);
-    compilation.unfreeze();
+    auto& driverAnalysis = getAnalysisManager();
     INFO("Driver analysis found {} diagnostics", driverAnalysis.getDiagnostics().size());
     for (auto& diag : driverAnalysis.getDiagnostics()) {
         diagEngine.issue(diag);
     }
+}
+
+std::vector<const slang::analysis::ValueDriver*> ServerCompilationAnalysis::getDrivers(
+    const slang::ast::ValueSymbol& symbol) {
+    return getAnalysisManager().getDrivers(symbol);
 }
 
 } // namespace server

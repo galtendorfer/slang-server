@@ -8,6 +8,8 @@
 #define CATCH_CONFIG_RUNNER
 #include "ServerHarness.h"
 #include <fstream>
+#include <rfl/from_generic.hpp>
+#include <unordered_set>
 
 DocumentHandle ServerHarness::openFile(std::string fileName) {
     auto root = m_workspaceFolder ? (m_workspaceFolder->uri.getPath()) : findSlangRoot();
@@ -29,12 +31,12 @@ DocumentHandle ServerHarness::openFile(std::string fileName) {
     }
 
     auto uri = URI::fromFile(root / fileName);
-    onDocDidOpen(
-        lsp::DidOpenTextDocumentParams{.textDocument = lsp::TextDocumentItem{
-                                           .uri = uri,
-                                           .languageId = lsp::LanguageKind::make<"systemverilog">(),
-                                           .version = 1,
-                                           .text = text}});
+    onDocDidOpen(lsp::DidOpenTextDocumentParams{
+        .textDocument = lsp::TextDocumentItem{
+            .uri = uri,
+            .languageId = lsp::LanguageKindOptions::from_name<"systemverilog">().str(),
+            .version = 1,
+            .text = text}});
 
     auto tree = getDocDocumentSymbol(
         lsp::DocumentSymbolParams{.textDocument = lsp::TextDocumentIdentifier{.uri = uri}});
@@ -48,12 +50,12 @@ DocumentHandle ServerHarness::openFile(std::string fileName, std::string text) {
     auto root = m_workspaceFolder ? (m_workspaceFolder->uri.getPath()) : findSlangRoot();
     auto uri = URI::fromFile(root / fileName);
 
-    onDocDidOpen(
-        lsp::DidOpenTextDocumentParams{.textDocument = lsp::TextDocumentItem{
-                                           .uri = uri,
-                                           .languageId = lsp::LanguageKind::make<"systemverilog">(),
-                                           .version = 1,
-                                           .text = text}});
+    onDocDidOpen(lsp::DidOpenTextDocumentParams{
+        .textDocument = lsp::TextDocumentItem{
+            .uri = uri,
+            .languageId = lsp::LanguageKindOptions::from_name<"systemverilog">().str(),
+            .version = 1,
+            .text = text}});
 
     return DocumentHandle(*this, uri, text);
 }
@@ -115,16 +117,16 @@ void ServerHarness::checkPrepareCallHierarchy(const Cursor& cursor,
     CHECK(got == expected);
 }
 
-template<typename ResultType, typename GetCallFunc, typename ExtractFunc>
-static void checkCallHierarchyGeneric(const std::string& path,
-                                      const std::set<ServerHarness::ExpectedHierResult>& expected,
-                                      GetCallFunc getCallFunc, ExtractFunc extractFunc) {
-    auto result = getCallFunc(path);
-
-    if (!result) {
-        CHECK(expected.empty());
-        return;
-    }
+void ServerHarness::checkConeCommand(const std::string& command, const std::string& path,
+                                     const std::set<ExpectedConeResult>& expected) {
+    auto response = getWorkspaceExecuteCommand(lsp::ExecuteCommandParams{
+        .command = command,
+        .arguments = std::vector<lsp::LSPAny>{rfl::to_generic(path)},
+    });
+    REQUIRE(response);
+    auto result = rfl::from_generic<std::vector<server::ConeEntry>>(*response);
+    REQUIRE(result);
+    CHECK(result.value().size() == expected.size());
 
     std::set<ExpectedStart> expStarts;
     for (const auto& expect : expected) {
@@ -134,38 +136,12 @@ static void checkCallHierarchyGeneric(const std::string& path,
     }
 
     std::set<ExpectedStart> gotStarts;
-    for (const auto& call : *result) {
-        CHECK(call.fromRanges.size() == 1);
-        auto [name, uri] = extractFunc(call);
-        gotStarts.insert({.name = name, .uri = uri.str(), .start = call.fromRanges[0].start});
+    for (const auto& entry : result.value()) {
+        gotStarts.insert({.name = entry.path,
+                          .uri = entry.location.uri.str(),
+                          .start = entry.location.range.start});
     }
     CHECK(gotStarts == expStarts);
-}
-
-void ServerHarness::checkIncomingCalls(const std::string& path,
-                                       const std::set<ExpectedHierResult>& expected) {
-    auto getCall = [this](const std::string& path) {
-        return getCallHierarchyIncomingCalls(
-            lsp::CallHierarchyIncomingCallsParams{.item = {.name = path}});
-    };
-    auto extract = [](const auto& incoming) -> std::pair<std::string, URI> {
-        return {incoming.from.name, incoming.from.uri};
-    };
-
-    checkCallHierarchyGeneric<lsp::CallHierarchyIncomingCall>(path, expected, getCall, extract);
-}
-
-void ServerHarness::checkOutgoingCalls(const std::string& path,
-                                       const std::set<ExpectedHierResult>& expected) {
-    auto getCall = [this](const std::string& path) {
-        return getCallHierarchyOutgoingCalls(
-            lsp::CallHierarchyOutgoingCallsParams{.item = {.name = path}});
-    };
-    auto extract = [](const auto& outgoing) -> std::pair<std::string, URI> {
-        return {outgoing.to.name, outgoing.to.uri};
-    };
-
-    checkCallHierarchyGeneric<lsp::CallHierarchyOutgoingCall>(path, expected, getCall, extract);
 }
 
 std::shared_ptr<server::SlangDoc> ServerHarness::getDoc(const URI& uri) {
@@ -187,9 +163,17 @@ std::vector<std::string> ServerHarness::getModulesInFile(const std::string& file
     return SlangServer::getModulesInFile(absolutePath.string());
 }
 
+const parsing::Token* getNavigationTokenAt(const std::shared_ptr<server::SlangDoc>& doc,
+                                         slang::SourceLocation loc) {
+    auto* token = doc->getWordTokenAt(loc);
+    if (!token && loc.offset() > 0)
+        token = doc->getWordTokenAt(loc - 1);
+    return token;
+}
+
 std::optional<std::vector<lsp::Location>> ServerHarness::getDocReferences(
-    const lsp::ReferenceParams& params) {
-    auto refs = SlangServer::getDocReferences(params);
+    const lsp::ReferenceParams& params, lsp::RequestContext ctx) {
+    auto refs = SlangServer::getDocReferences(params, ctx);
     if (!refs) {
         return refs;
     }
@@ -200,7 +184,7 @@ std::optional<std::vector<lsp::Location>> ServerHarness::getDocReferences(
     auto srcLoc = srcDoc->getLocation(params.position);
     REQUIRE(srcLoc.has_value());
 
-    auto srcTok = srcDoc->getWordTokenAt(*srcLoc);
+    auto srcTok = getNavigationTokenAt(srcDoc, *srcLoc);
     REQUIRE(srcTok);
 
     auto expectedText = std::string(srcTok->valueText());
@@ -279,6 +263,16 @@ void DocumentHandle::erase(size_t start, size_t end) {
     state = DocState::Dirty;
 }
 
+void DocumentHandle::replaceAll(std::string text) {
+    CHECK(state != DocState::Closed);
+
+    m_text = text;
+    pending_changes.push_back(
+        {lsp::TextDocumentContentChangeWholeDocument{.text = std::move(text)}});
+
+    state = DocState::Dirty;
+}
+
 void DocumentHandle::publishChanges() {
     CHECK(state == DocState::Dirty);
     m_server.onDocDidChange(lsp::DidChangeTextDocumentParams{
@@ -314,12 +308,12 @@ void DocumentHandle::close() {
 void DocumentHandle::open() {
     CHECK(state == DocState::Closed);
 
-    m_server.onDocDidOpen(
-        lsp::DidOpenTextDocumentParams{.textDocument = lsp::TextDocumentItem{
-                                           .uri = m_uri,
-                                           .languageId = lsp::LanguageKind::make<"systemverilog">(),
-                                           .version = 1,
-                                           .text = m_text}});
+    m_server.onDocDidOpen(lsp::DidOpenTextDocumentParams{
+        .textDocument = lsp::TextDocumentItem{
+            .uri = m_uri,
+            .languageId = lsp::LanguageKindOptions::from_name<"systemverilog">().str(),
+            .version = 1,
+            .text = m_text}});
     state = DocState::Open;
 }
 
@@ -335,6 +329,16 @@ lsp::Position DocumentHandle::getPosition(lsp::uint offset) {
         }
     }
     return lsp::Position{line, col};
+}
+
+lsp::uint DocumentHandle::getOffset(const lsp::Position& position) const {
+    lsp::uint line = 0;
+    lsp::uint offset = 0;
+    while (offset < m_text.size() && line < position.line) {
+        if (m_text[offset++] == '\n')
+            line++;
+    }
+    return std::min<lsp::uint>(offset + position.character, m_text.size());
 }
 
 std::vector<lsp::DocumentSymbol> DocumentHandle::getSymbolTree() {
@@ -368,22 +372,43 @@ std::vector<CompletionHandle> Cursor::getCompletions(std::optional<std::string> 
         .position = m_doc.getPosition(m_offset),
     });
 
-    if (rfl::holds_alternative<std::vector<lsp::CompletionItem>>(ret)) {
-        auto res = rfl::get<std::vector<lsp::CompletionItem>>(ret);
-        std::vector<CompletionHandle> handles;
-        handles.reserve(res.size());
-        for (auto& item : res) {
-            handles.emplace_back(*this, item);
-        }
-        return handles;
-    }
-    else if (rfl::holds_alternative<lsp::CompletionList>(ret)) {
-        SLANG_ASSERT(false && "CompletionList not supported in this context");
+    std::vector<lsp::CompletionItem> items;
+    if (rfl::holds_alternative<std::vector<lsp::CompletionItem>>(ret))
+        items = rfl::get<std::vector<lsp::CompletionItem>>(std::move(ret));
+    else if (rfl::holds_alternative<lsp::CompletionList>(ret))
+        items = rfl::get<lsp::CompletionList>(std::move(ret)).items;
+    else
         return {};
+
+    std::vector<CompletionHandle> handles;
+    handles.reserve(items.size());
+    for (auto& item : items) {
+        handles.emplace_back(*this, std::move(item));
+    }
+    return handles;
+}
+
+void CompletionHandle::insert() {
+    if (!m_item.textEdit) {
+        m_cursor.write(m_item.insertText.value_or(m_item.label));
+        return;
+    }
+
+    lsp::TextEdit edit;
+    if (rfl::holds_alternative<lsp::TextEdit>(*m_item.textEdit)) {
+        edit = rfl::get<lsp::TextEdit>(*m_item.textEdit);
     }
     else {
-        return {};
+        auto insertReplace = rfl::get<lsp::InsertReplaceEdit>(*m_item.textEdit);
+        edit = lsp::TextEdit{.range = insertReplace.replace,
+                             .newText = std::move(insertReplace.newText)};
     }
+
+    auto start = m_cursor.m_doc.getOffset(edit.range.start);
+    auto end = m_cursor.m_doc.getOffset(edit.range.end);
+    m_cursor.m_doc.erase(start, end);
+    m_cursor.m_doc.insert(start, edit.newText);
+    m_cursor.m_offset = start + static_cast<lsp::uint>(edit.newText.size());
 }
 
 std::vector<lsp::CompletionItem> Cursor::getResolvedCompletions(
@@ -391,8 +416,14 @@ std::vector<lsp::CompletionItem> Cursor::getResolvedCompletions(
     auto completions = getCompletions(triggerChar);
     std::vector<lsp::CompletionItem> resolvedItems;
     resolvedItems.reserve(completions.size());
+    std::unordered_set<std::string> rawLabels;
 
     for (auto& completion : completions) {
+        // No empty labels
+        REQUIRE(!completion.m_item.label.empty());
+        CAPTURE(completion.m_item.label);
+        // Unique labels
+        REQUIRE(rawLabels.insert(completion.m_item.label).second);
         completion.resolve();
         resolvedItems.push_back(completion.m_item);
     }
@@ -457,14 +488,14 @@ std::vector<lsp::DocumentHighlight> Cursor::getHighlights() {
 }
 
 std::optional<slang::SourceLocation> DocumentHandle::getLocation(lsp::uint offset) {
-    return doc->getSourceManager().getSourceLocation(doc->getBuffer(), offset);
+    return slang::SourceLocation(doc->getBuffer(), offset);
 }
 
 std::optional<lsp::Position> DocumentHandle::getLspLocation(lsp::uint offset) {
     auto loc = getLocation(offset);
     if (!loc)
         return std::nullopt;
-    auto line = m_server.sourceManager().getLineNumber(*loc);
+    auto line = m_server.sourceManager().getRawLineNumber(*loc);
     auto col = m_server.sourceManager().getColumnNumber(*loc);
     return lsp::Position{static_cast<lsp::uint>(line - 1), static_cast<lsp::uint>(col - 1)};
 }

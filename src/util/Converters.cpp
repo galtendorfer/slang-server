@@ -40,19 +40,22 @@ std::optional<const parsing::Token> findNameToken(const syntax::SyntaxNode* node
 }
 
 lsp::Position toPosition(const SourceLocation& loc, const SourceManager& sourceManager) {
-    auto character = sourceManager.getColumnNumber(loc);
-    return lsp::Position{.line = static_cast<lsp::uint>(sourceManager.getLineNumber(loc) - 1),
+    auto actualLoc = sourceManager.getFullyExpandedLoc(loc);
+    auto character = sourceManager.getColumnNumber(actualLoc);
+    return lsp::Position{.line = static_cast<lsp::uint>(sourceManager.getRawLineNumber(actualLoc) -
+                                                        1),
                          .character = static_cast<lsp::uint>(character > 0 ? character - 1 : 0)};
 }
 
-lsp::Range toRange(const SourceRange& range, const SourceManager& sourceManager) {
-    return lsp::Range{.start = toPosition(range.start(), sourceManager),
-                      .end = toPosition(range.end(), sourceManager)};
+std::optional<SourceLocation> toSourceLocation(BufferID buffer, const lsp::Position& position,
+                                               const SourceManager& sourceManager) {
+    return sourceManager.getSourceLocation(buffer, position.line + 1, position.character + 1);
 }
 
-lsp::Range toOriginalRange(const SourceRange& range, const SourceManager& sourceManager) {
-    auto origRange = sourceManager.getFullyOriginalRange(range);
-    return toRange(origRange, sourceManager);
+lsp::Range toRange(const SourceRange& range, const SourceManager& sourceManager) {
+    auto actualRange = sourceManager.getFullyExpandedRange(range);
+    return lsp::Range{.start = toPosition(actualRange.start(), sourceManager),
+                      .end = toPosition(actualRange.end(), sourceManager)};
 }
 
 lsp::Location toOriginalLocation(const SourceRange& range, const SourceManager& sourceManager) {
@@ -66,25 +69,14 @@ lsp::Location toOriginalLocation(const SourceRange& range, const SourceManager& 
 lsp::Range toRange(const SourceLocation& loc, const SourceManager& sourceManager,
                    const size_t length) {
 
-    auto character = sourceManager.getColumnNumber(loc);
-    lsp::Position start{.line = static_cast<lsp::uint>(sourceManager.getLineNumber(loc) - 1),
-                        .character = static_cast<lsp::uint>(character > 0 ? character - 1 : 0)};
+    auto start = toPosition(loc, sourceManager);
     lsp::Position end{start};
     end.character += length;
     return lsp::Range{.start = start, .end = end};
 }
 
 lsp::Location toLocation(const SourceRange& range, const SourceManager& sourceManager) {
-    // TODO: make this logic just one function in source manager
-    auto declRange = range;
-
-    // Get location of `MACRO_USAGE if from a macro expansion
-    auto locs = sourceManager.getMacroExpansions(range.start());
-    if (locs.size()) {
-        auto macroInfo = sourceManager.getMacroInfo(locs.back());
-        declRange = macroInfo ? macroInfo->expansionRange
-                              : sourceManager.getFullyOriginalRange(range);
-    }
+    auto declRange = sourceManager.getFullyExpandedRange(range);
 
     return lsp::Location{.uri = URI::fromFile(
                              sourceManager.getFullPath(declRange.start().buffer())),
@@ -92,9 +84,10 @@ lsp::Location toLocation(const SourceRange& range, const SourceManager& sourceMa
 }
 
 lsp::Location toLocation(const SourceLocation& loc, const SourceManager& sourceManager) {
-    return lsp::Location{.uri = URI::fromFile(sourceManager.getFullPath(loc.buffer())),
-                         .range = lsp::Range{.start = toPosition(loc, sourceManager),
-                                             .end = toPosition(loc + 1, sourceManager)}};
+    auto actualLoc = sourceManager.getFullyExpandedLoc(loc);
+    return lsp::Location{.uri = URI::fromFile(sourceManager.getFullPath(actualLoc.buffer())),
+                         .range = lsp::Range{.start = toPosition(actualLoc, sourceManager),
+                                             .end = toPosition(actualLoc, sourceManager)}};
 }
 
 lsp::SymbolKind toSymbolKind(const syntax::SyntaxKind& kind) {
@@ -118,7 +111,8 @@ lsp::SymbolKind toSymbolKind(const syntax::SyntaxKind& kind) {
 }
 
 lsp::MarkupContent markdown(std::string& md) {
-    return lsp::MarkupContent{.kind = lsp::MarkupKind::make<"markdown">(), .value = md};
+    return lsp::MarkupContent{.kind = lsp::MarkupKindOptions::from_name<"markdown">().str(),
+                              .value = md};
 }
 
 std::string subroutineString(ast::SubroutineKind kind) {

@@ -11,6 +11,7 @@
 
 #include "Config.h"
 #include "ast/WcpClient.h"
+#include "completions/CompletionContext.h"
 #include "completions/CompletionDispatch.h"
 #include "lsp/LspTypeExtensions.h"
 #include "lsp/LspTypes.h"
@@ -19,6 +20,7 @@
 #include "util/Logging.h"
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <filesystem>
 #include <fmt/base.h>
 #include <fmt/ranges.h>
@@ -29,14 +31,13 @@
 #include <rfl/from_generic.hpp>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
-#include "slang/ast/Compilation.h"
-#include "slang/ast/Scope.h"
-#include "slang/ast/symbols/InstanceSymbols.h"
-#include "slang/driver/Driver.h"
+#include "slang/syntax/AllSyntax.h"
 #include "slang/syntax/SyntaxPrinter.h"
+#include "slang/syntax/SyntaxVisitor.h"
 #include "slang/text/SourceLocation.h"
 #include "slang/text/SourceManager.h"
 #include "slang/util/OS.h"
@@ -47,12 +48,7 @@ namespace fs = std::filesystem;
 
 namespace server {
 
-SlangServer::SlangServer(SlangLspClient& client) :
-    m_client(client), guard(OS::captureOutput([this](std::string_view text, bool isStdout) {
-        driverPrintCb(text, isStdout);
-    })),
-    m_config(Config()) // This routes messages from the slang driver to lsp notifications
-{
+SlangServer::SlangServer(SlangLspClient& client) : m_client(client), m_config(Config()) {
 
     /// Keep this short to get server started quickly
     registerInitialize();
@@ -78,6 +74,7 @@ lsp::InitializeResult SlangServer::getInitialize(const lsp::InitializeParams& pa
     registerCompletionItemResolve();
     registerDocDocumentHighlight();
 
+    registerDocCodeLens();
     registerDocInlayHint();
     registerDocReferences();
     registerDocRename();
@@ -95,6 +92,7 @@ lsp::InitializeResult SlangServer::getInitialize(const lsp::InitializeParams& pa
 
     // LSP Lifecycle
     registerInitialized();
+    registerCancelRequest();
 
     INFO("Server started with pid: {}", OS::getpid());
 
@@ -112,20 +110,43 @@ lsp::InitializeResult SlangServer::getInitialize(const lsp::InitializeParams& pa
         "slang.addToWaveform");
     registerCommand<std::string, std::monostate, &SlangServer::openWaveform>("slang.openWaveform");
 
+    registerDesignCommand<std::string, std::vector<server::ConeEntry>>(
+        "slang.getDriversWithLocation", [](ServerCompilation& comp, const std::string& hierPath) {
+            return comp.getConeLocations<true>(hierPath);
+        });
+    registerDesignCommand<std::string, std::vector<server::ConeEntry>>(
+        "slang.getLoadsWithLocation", [](ServerCompilation& comp, const std::string& hierPath) {
+            return comp.getConeLocations<false>(hierPath);
+        });
+
     // Hierarchy View (sidebar)
     registerCommand<std::string, std::vector<hier::HierItem_t>, &SlangServer::getScope>(
         "slang.getScope");
+    registerCommand<std::string, std::vector<hier::ScopeStep>, &SlangServer::getScopes>(
+        "slang.getScopes");
+    registerDesignCommand<std::string, hier::HierarchySearchResult>(
+        "slang.searchHierarchy", [](ServerCompilation& comp, const std::string& query) {
+            return comp.searchHierarchy(query);
+        });
+    registerCommand<ShowHierLocationArgs, std::monostate, &SlangServer::showHierLocation>(
+        "slang.showHierLocation");
+    registerCommand<std::string, std::monostate, &SlangServer::openModuleDefinition>(
+        "slang.openModuleDefinition");
 
     // Terminal Links
     registerCommand<std::string, std::vector<std::string>, &SlangServer::getFilesContainingModule>(
         "slang.getFilesContainingModule");
 
-    // Instances View
+    // Hierarchy and active instance selection
     registerCommand<std::monostate, std::vector<hier::InstanceSet>,
                     &SlangServer::getScopesByModule>("slang.getScopesByModule");
     registerCommand<std::string, std::vector<hier::QualifiedInstance>,
                     &SlangServer::getInstancesOfModule>("slang.getInstancesOfModule");
-
+    registerCommand<std::string, bool, &SlangServer::setActiveInstance>("slang.setActiveInstance");
+    registerCommand<SlangLspClient::ActivateInstanceParams, bool, &SlangServer::activateInstance>(
+        "slang.activateInstance");
+    registerCommand<std::string, std::optional<hier::QualifiedInstance>,
+                    &SlangServer::getActiveInstance>("slang.getActiveInstance");
     // File features
     registerCommand<ExpandMacroArgs, bool, &SlangServer::expandMacros>("slang.expandMacros");
 
@@ -161,77 +182,113 @@ lsp::InitializeResult SlangServer::getInitialize(const lsp::InitializeParams& pa
         WARN("No workspace folder or root provided");
     }
 
+    m_client.capabilities = SlangLspClient::Capabilities(params.capabilities);
+
     loadConfig();
+    m_driver->completions.resolveEdits = m_client.capabilities.completionEditResolveSupported;
 
     if (params.capabilities.experimental) {
         auto exp = rfl::from_generic<lsp::ExperimentalClientCapabilities>(
             *params.capabilities.experimental);
 
-        if (exp && exp->inactiveRegions && exp->inactiveRegions->inactiveRegions.value_or(false)) {
-            m_client.experimentalCapabilities.inactiveRegionsSupported = true;
+        if (exp) {
+            if (exp->slangClient) {
+                const auto& client = *exp->slangClient;
+                const auto clientName = client.name.value_or("slang client");
+                INFO("Using {} v{}", clientName, client.version.value_or("unknown"));
+                auto parseVersion = [](std::string_view version) {
+                    std::optional<std::pair<int, int>> result;
+                    if (version.starts_with('v'))
+                        version.remove_prefix(1);
+
+                    int major = 0;
+                    auto [majorEnd, majorError] =
+                        std::from_chars(version.data(), version.data() + version.size(), major);
+                    if (majorError != std::errc() || majorEnd == version.data() + version.size() ||
+                        *majorEnd != '.') {
+                        return result;
+                    }
+
+                    int minor = 0;
+                    auto [minorEnd, minorError] =
+                        std::from_chars(majorEnd + 1, version.data() + version.size(), minor);
+                    if (minorError != std::errc() ||
+                        (minorEnd != version.data() + version.size() && *minorEnd != '.')) {
+                        return result;
+                    }
+                    return std::optional(std::pair(major, minor));
+                };
+
+                const auto parsed = client.version ? parseVersion(*client.version) : std::nullopt;
+                const auto required = std::pair(VersionInfo::getMajor(), VersionInfo::getMinor());
+                if (!parsed) {
+                    m_client.showWarning(
+                        fmt::format("Could not determine the {} version. Please update {}.",
+                                    clientName, clientName));
+                }
+                else if (*parsed < required) {
+                    m_client.showWarning(fmt::format(
+                        "{} v{} is older than the server requirement {}.{}.x. Please update {}.",
+                        clientName, *client.version, required.first, required.second, clientName));
+                }
+            }
         }
     }
 
-    auto result =
-        lsp::InitializeResult{
-            .capabilities =
-                lsp::ServerCapabilities{
-                    .textDocumentSync =
-                        lsp::TextDocumentSyncOptions{
-                            .openClose = true,
-                            .change = lsp::TextDocumentSyncKind::Incremental,
-                            .save =
-                                lsp::SaveOptions{
-                                    .includeText = true,
-                                },
-                        },
-                    .completionProvider =
-                        lsp::CompletionOptions{
-                            .triggerCharacters =
-                                std::vector<std::string>{
-                                    "`", // macros
-                                    "#", // hierarchial inst- modules and interfaces
-                                    ".", // hierarchical references. TODO: params, ports
-                                    "(", // function calls
-                                    ":", // pkg scope (::), wire width
-                                    "[", // wire width, array indexing
-                                    // "$"  // builtins
-                                },
-                            .resolveProvider = true,
-                            .completionItem =
-                                lsp::ServerCompletionItemOptions{
-                                    .labelDetailsSupport = true,
-                                }},
-                    .hoverProvider = true,
-                    .definitionProvider = true,
-                    .referencesProvider = true,
-                    .documentHighlightProvider = true,
-                    .documentSymbolProvider = true,
-                    .codeActionProvider = true,
-                    .documentLinkProvider =
-                        lsp::DocumentLinkOptions{
-                            .resolveProvider = false,
-                            .workDoneProgress = false,
-                        },
-                    .workspaceSymbolProvider = true,
-                    .renameProvider = true,
-                    .executeCommandProvider =
-                        lsp::ExecuteCommandOptions{
-                            .commands = getCommandList(),
-                        },
-                    .callHierarchyProvider = true,
-                    .inlayHintProvider =
-                        lsp::InlayHintOptions{
-                            .resolveProvider = false,
-                        },
+    auto result = lsp::InitializeResult{
+        .capabilities =
+            lsp::ServerCapabilities{
+                .textDocumentSync =
+                    lsp::TextDocumentSyncOptions{
+                        .openClose = true,
+                        .change = lsp::TextDocumentSyncKind::Incremental,
+                        .save =
+                            lsp::SaveOptions{
+                                .includeText = true,
+                            },
+                    },
+                .completionProvider =
+                    lsp::CompletionOptions{.triggerCharacters =
+                                               completions::completionTriggerCharacters(),
+                                           .resolveProvider = true,
+                                           .completionItem =
+                                               lsp::ServerCompletionItemOptions{
+                                                   .labelDetailsSupport = true,
+                                               }},
+                .hoverProvider = true,
+                .definitionProvider = true,
+                .referencesProvider = true,
+                .documentHighlightProvider = true,
+                .documentSymbolProvider = true,
+                .codeActionProvider = true,
+                .codeLensProvider =
+                    lsp::CodeLensOptions{
+                        .resolveProvider = false,
+                    },
+                .documentLinkProvider =
+                    lsp::DocumentLinkOptions{
+                        .resolveProvider = false,
+                        .workDoneProgress = false,
+                    },
+                .workspaceSymbolProvider = true,
+                .renameProvider = true,
+                .executeCommandProvider =
+                    lsp::ExecuteCommandOptions{
+                        .commands = getCommandList(),
+                    },
+                .callHierarchyProvider = true,
+                .inlayHintProvider =
+                    lsp::InlayHintOptions{
+                        .resolveProvider = false,
+                    },
 
-                },
-            .serverInfo = lsp::ServerInfo{.name = "slang-server",
-                                          .version = fmt::format(
-                                              "{}.{}.{}+{}\n", VersionInfo::getMajor(),
-                                              VersionInfo::getMinor(), VersionInfo::getPatch(),
-                                              VersionInfo::getHash())},
-        };
+            },
+        .serverInfo =
+            lsp::ServerInfo{.name = "slang-server",
+                            .version = fmt::format("{}.{}.{}+{}\n", VersionInfo::getMajor(),
+                                                   VersionInfo::getMinor(), VersionInfo::getPatch(),
+                                                   VersionInfo::getHash())},
+    };
 
     INFO("Initialize result: {} ", rfl::json::write(result));
 
@@ -278,7 +335,11 @@ void SlangServer::setExplore() {
     m_topFile = std::nullopt;
 
     // Move data into the Server Driver
-    m_driver = ServerDriver::create(m_indexer, m_client, m_config, {}, m_driver.get());
+    const auto workspacePath = m_workspaceFolder ? std::optional<std::string_view>(
+                                                       m_workspaceFolder->uri.getPath())
+                                                 : std::nullopt;
+    m_driver = ServerDriver::createForExplore(m_indexer, m_client, m_config, workspacePath,
+                                              m_driver.get());
     m_driver->diagClient->pushDiags();
 }
 
@@ -287,40 +348,31 @@ std::monostate SlangServer::setTopLevel(const std::string& path) {
         setExplore();
         return std::monostate{};
     }
-    INFO("Setting top level to {}", path);
-    auto uri = URI::fromFile(path);
-    auto doc = m_driver->getDocument(uri);
-    if (!doc) {
-        m_client.showError("Document not found: " + path);
-        return std::monostate{};
-    }
-    m_topFile = path;
-    // Get top name from shallow parse
-    {
-        auto topTree = doc->getSyntaxTree();
 
-        std::string_view topName;
-        if (topTree->getMetadata().nodeMeta.size() == 1) {
-            topName = topTree->getMetadata().nodeMeta[0].first->header->name.valueText();
+    const auto workspacePath = m_workspaceFolder ? std::optional<std::string_view>(
+                                                       m_workspaceFolder->uri.getPath())
+                                                 : std::nullopt;
+
+    // Resolve relative paths against the workspace folder. The driver keys its documents by
+    // absolute-path URI, so an unresolved relative path matches nothing and the top level
+    // silently fails to load.
+    auto topPath = fs::path(path);
+    if (topPath.is_relative()) {
+        if (!workspacePath) {
+            m_client.showError(fmt::format(
+                "Cannot set top level to relative path {}: no workspace folder to resolve it "
+                "against. Use an absolute path.",
+                path));
+            return std::monostate{};
         }
-        else {
-            slang::ast::Compilation shallowCompilation;
-            shallowCompilation.addSyntaxTree(topTree);
-            if (shallowCompilation.getRoot().topInstances.empty()) {
-                m_client.showError("No top modules found in: " + path);
-                return std::monostate{};
-            }
-            for (auto& top : shallowCompilation.getRoot().topInstances.subspan(1)) {
-                WARN("Extra top module: {}", top->name);
-            }
-            if (shallowCompilation.getRoot().topInstances.size() == 0) {
-                m_client.showError("No top modules found in " + path);
-                return std::monostate{};
-            }
-            topName = shallowCompilation.getRoot().topInstances[0]->name;
-        }
-        m_driver->createCompilation(doc, topName);
+        topPath = (fs::path(*workspacePath) / topPath).lexically_normal();
     }
+
+    INFO("Setting top level to {}", topPath.string());
+    m_topFile = topPath.string();
+
+    m_driver = ServerDriver::createFromTop(m_indexer, m_client, m_config, URI::fromFile(topPath),
+                                           workspacePath, m_driver.get());
 
     return std::monostate{};
 }
@@ -332,9 +384,12 @@ std::monostate SlangServer::setBuildFile(const std::string& path) {
     }
     m_buildfile = path;
 
-    m_driver = ServerDriver::create(m_indexer, m_client, m_config, std::vector<std::string>{path},
-                                    m_driver.get());
-    m_driver->createCompilation();
+    const auto workspacePath = m_workspaceFolder ? std::optional<std::string_view>(
+                                                       m_workspaceFolder->uri.getPath())
+                                                 : std::nullopt;
+    m_driver = ServerDriver::createFromFileLists(m_indexer, m_client, m_config,
+                                                 std::vector<std::string>{path}, workspacePath,
+                                                 m_driver.get());
     return std::monostate{};
 }
 
@@ -352,9 +407,15 @@ std::vector<hier::QualifiedInstance> SlangServer::getInstancesOfModule(
         ERROR("No compilation available, cannot get instances of module {}", moduleName);
         return {};
     }
-    auto result = m_driver->comp->getInstancesOfModule(moduleName);
-    if (result.empty()) {
+    auto instances = m_driver->comp->getInstancesOfModule(moduleName);
+    if (instances.empty()) {
         m_client.showError(fmt::format("Module {} not found", moduleName));
+        return {};
+    }
+    std::vector<hier::QualifiedInstance> result;
+    result.reserve(instances.size());
+    for (const auto* inst : instances) {
+        result.push_back(hier::toQualifiedInstance(*inst, m_driver->sm));
     }
     return result;
 }
@@ -366,7 +427,7 @@ bool SlangServer::expandMacros(ExpandMacroArgs args) {
         return false;
     }
 
-    SyntaxPrinter printer(doc->getSyntaxTree()->sourceManager());
+    syntax::SyntaxPrinter printer(doc->getSyntaxTree()->sourceManager());
     printer.setSquashNewlines(false);
     printer.setIncludeDirectives(true);
     printer.setExpandMacros(true);
@@ -388,6 +449,130 @@ std::vector<hier::HierItem_t> SlangServer::getScope(const std::string& hierPath)
         return {};
     }
     return m_driver->comp->getScope(hierPath);
+}
+
+// Returns scopes up to the last resolvable segment of the provided hierarchical path.
+std::vector<hier::ScopeStep> SlangServer::getScopes(const std::string& hierPath,
+                                                    const lsp::RequestContext& ctx) {
+    if (!m_driver->comp) {
+        ctx.error("No compilation available, cannot get scopes for {}", hierPath);
+        return {};
+    }
+    auto scopes = m_driver->comp->getScopes(hierPath, ctx);
+    ctx.info("Resolved {} hierarchy scopes for {}", scopes.size(), hierPath);
+    return scopes;
+}
+
+bool SlangServer::setActiveInstance(const std::string& hierPath) {
+    if (!m_driver || !m_driver->setActiveInstance(hierPath)) {
+        m_client.showError(fmt::format("Failed to set active instance {}", hierPath));
+        return false;
+    }
+    return true;
+}
+
+bool SlangServer::activateInstance(const SlangLspClient::ActivateInstanceParams& params,
+                                   const lsp::RequestContext& ctx) {
+    ctx.throwIfCancelled("before activating instance");
+    if (!setActiveInstance(params.hierPath))
+        return false;
+
+    m_client.onActiveInstanceChanged(params);
+    if (params.interactionSource == SlangLspClient::InteractionSource::codeLensGotoInstantiation) {
+        showHierLocation({.hierPath = params.hierPath, .takeFocus = true});
+    }
+    ctx.info("Activated instance {}", params.hierPath);
+    return true;
+}
+
+std::optional<hier::QualifiedInstance> SlangServer::getActiveInstance(
+    const std::string& moduleName) {
+    if (!m_driver->comp) {
+        ERROR("No compilation available, cannot get active instance for {}", moduleName);
+        return std::nullopt;
+    }
+    return m_driver->comp->getActiveInstance(moduleName);
+}
+
+std::optional<lsp::Location> SlangServer::getHierLocation(const std::string& hierPath) {
+    if (!m_driver->comp) {
+        ERROR("No compilation available, cannot resolve location for {}", hierPath);
+        return std::nullopt;
+    }
+    auto location = m_driver->comp->getHierLocation(hierPath);
+    if (location) {
+        return location;
+    }
+
+    // Packages aren't always part of the active build; fall back to any open doc.
+    auto separator = hierPath.rfind("::");
+    if (separator == std::string::npos) {
+        WARN("getHierLocation: failed to resolve {}", hierPath);
+        return std::nullopt;
+    }
+    auto packageName = std::string_view(hierPath).substr(0, separator);
+    auto memberName = std::string_view(hierPath).substr(separator + 2);
+    for (const auto& [_, doc] : m_driver->docs) {
+        auto analysis = doc->getAnalysis();
+        auto* pkg = analysis->getCompilation()->getPackage(packageName);
+        auto* member = pkg ? pkg->lookupName(memberName) : nullptr;
+        if (!member) {
+            continue;
+        }
+        if (member->location.valid()) {
+            auto memberLoc = toLocation(member->location, m_driver->sm);
+            if (!memberLoc.uri.getPath().empty()) {
+                return memberLoc;
+            }
+        }
+        if (auto* syntax = member->getSyntax()) {
+            auto memberLoc = toLocation(syntax->sourceRange(), m_driver->sm);
+            if (!memberLoc.uri.getPath().empty()) {
+                return memberLoc;
+            }
+        }
+    }
+    WARN("getHierLocation: failed to resolve {}", hierPath);
+    return std::nullopt;
+}
+
+std::monostate SlangServer::showHierLocation(const ShowHierLocationArgs& args) {
+    auto location = getHierLocation(args.hierPath);
+    if (!location) {
+        return {};
+    }
+    m_client.onShowDocument(lsp::ShowDocumentParams{
+        .uri = location->uri,
+        .takeFocus = args.takeFocus,
+        .selection = location->range,
+    });
+    return {};
+}
+
+std::monostate SlangServer::openModuleDefinition(const std::string& moduleName) {
+    if (!m_driver->comp) {
+        ERROR("No compilation available, cannot open module definition for {}", moduleName);
+        return {};
+    }
+    auto instances = m_driver->comp->getInstancesOfModule(moduleName);
+    if (instances.empty()) {
+        WARN("openModuleDefinition: module {} has no instances", moduleName);
+        return {};
+    }
+    auto declLoc = toLocation(instances[0]->getDefinition().location, m_driver->sm);
+    if (declLoc.uri.getPath().empty()) {
+        WARN("openModuleDefinition: module {} declaration has no source location", moduleName);
+        return {};
+    }
+    if (m_driver->isDocumentOpen(declLoc.uri)) {
+        return {};
+    }
+    m_client.onShowDocument(lsp::ShowDocumentParams{
+        .uri = declLoc.uri,
+        .takeFocus = false,
+        .selection = declLoc.range,
+    });
+    return {};
 }
 
 // TODO -- Underlying InstanceVisitor implementation is slow for larger designs -- fix
@@ -470,27 +655,48 @@ std::optional<std::vector<lsp::CallHierarchyItem>> SlangServer::getDocPrepareCal
         ERROR("No compilation available, cannot trace cones");
         return std::nullopt;
     }
+
     return m_driver->comp->getDocPrepareCallHierarchy(params);
 }
 
+// TODO: Use custom client code to render drivers/loads
 std::optional<std::vector<lsp::CallHierarchyIncomingCall>> SlangServer::
     getCallHierarchyIncomingCalls(const lsp::CallHierarchyIncomingCallsParams& params) {
     if (!m_driver->comp) {
         ERROR("No compilation available, cannot trace cones");
         return std::nullopt;
     }
-    return m_driver->comp->getCallHierarchyCalls<lsp::CallHierarchyIncomingCallsParams,
-                                                 lsp::CallHierarchyIncomingCall>(params);
+    // Drivers are presented as "incoming calls" in the call hierarchy view.
+    std::vector<lsp::CallHierarchyIncomingCall> result;
+    for (const auto& entry : m_driver->comp->getConeLocations<true>(params.item.name)) {
+        result.push_back({
+            .from =
+                {
+                    .name = entry.path,
+                    .uri = entry.location.uri,
+                    .range = entry.location.range,
+                    .selectionRange = entry.location.range,
+                },
+            // This is intended to show the 'edge', which would be where this driver
+            // connects to the current item. This could be multiple locations in a
+            // process. For the default neovim UI, these need a location.
+            .fromRanges = {entry.location.range},
+        });
+    }
+    return result;
 }
 
 std::optional<std::vector<lsp::CallHierarchyOutgoingCall>> SlangServer::
-    getCallHierarchyOutgoingCalls(const lsp::CallHierarchyOutgoingCallsParams& params) {
-    if (!m_driver->comp) {
-        ERROR("No compilation available, cannot trace cones");
-        return std::nullopt;
-    }
-    return m_driver->comp->getCallHierarchyCalls<lsp::CallHierarchyOutgoingCallsParams,
-                                                 lsp::CallHierarchyOutgoingCall>(params);
+    getCallHierarchyOutgoingCalls(const lsp::CallHierarchyOutgoingCallsParams&) {
+    m_client.showWarning("Load tracing through the call hierarchy is not currently supported");
+
+    // This was removed since showing loads through this route can't work accross files - it doesn't
+    // fit this lsp method.
+
+    // In the future we can add:
+    // - Actual call hierarchies, although these won't be very deep/useful in hdl, but perhaps dv
+    // - Module Hierarchies
+    return std::nullopt;
 }
 
 std::vector<std::string> SlangServer::getDrivers(const std::string& path) {
@@ -514,8 +720,6 @@ void SlangServer::loadConfig(const Config& config, bool forceIndexing) {
     m_config = Config(config);
 
     if (m_config.build.value().has_value()) {
-        // Keep this as a log line instead of a popup so opening the workspace
-        // does not show the same informational notification every time.
         INFO("Using build file: {}", *m_config.build.value());
         setBuildFile(*m_config.build.value());
     }
@@ -632,7 +836,19 @@ std::monostate SlangServer::addDefine(const std::string& macroName) {
 
 rfl::Variant<lsp::Definition, std::vector<lsp::DefinitionLink>, std::monostate> SlangServer::
     getDocDefinition(const lsp::DefinitionParams& params) {
-    return m_driver->getDocDefinition(params.textDocument.uri, params.position);
+    if (auto instance = m_driver->getDesignInstancePathAt(params.textDocument.uri,
+                                                          params.position)) {
+        activateInstance({
+            .hierPath = std::move(*instance),
+            .interactionSource = SlangLspClient::InteractionSource::editor,
+        });
+    }
+
+    auto info = m_driver->getDefinitionInfoAt(params.textDocument.uri, params.position);
+    if (m_client.capabilities.definitionLinksSupported)
+        return info ? info->getDefinitionLspLinks() : std::vector<lsp::DefinitionLink>{};
+
+    return lsp::Definition(info ? info->getDefinitionLspLocs() : std::vector<lsp::Location>{});
 }
 
 std::optional<lsp::Hover> SlangServer::getDocHover(const lsp::HoverParams& params) {
@@ -680,8 +896,9 @@ void SlangServer::onDocDidOpen(const lsp::DidOpenTextDocumentParams& params) {
     m_driver->openDocument(params.textDocument.uri, params.textDocument.text);
 }
 
-void SlangServer::onDocDidChange(const lsp::DidChangeTextDocumentParams& params) {
-    m_driver->onDocDidChange(params);
+void SlangServer::onDocDidChange(const lsp::DidChangeTextDocumentParams& params,
+                                 lsp::RequestContext ctx) {
+    m_driver->onDocDidChange(params, ctx);
 }
 
 void SlangServer::onDocDidSave(const lsp::DidSaveTextDocumentParams& params) {
@@ -704,12 +921,11 @@ void SlangServer::onDocDidSave(const lsp::DidSaveTextDocumentParams& params) {
             // Recover by overwriting the buffer with the saved text
             INFO("Document text does not match on save, overwriting");
             m_driver->openDocument(params.textDocument.uri, text);
+            doc = m_driver->getDocument(params.textDocument.uri);
         }
     }
-    m_driver->updateDoc(*doc, FileUpdateType::SAVE);
 
-    // Update the indexer with new symbols
-    m_indexer.updateDocument(params.textDocument.uri.getPath(), *doc->getSyntaxTree());
+    m_driver->onDocDidSave(*doc);
 }
 
 void SlangServer::onDocDidClose(const lsp::DidCloseTextDocumentParams& params) {
@@ -728,7 +944,7 @@ void SlangServer::onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFi
             break;
         }
         if (path.ends_with(".f") &&
-            m_driver->driver.getDefineSources().contains(std::filesystem::path(path))) {
+            m_driver->driver.getCommandFileMetadata().contains(std::filesystem::path(path))) {
             needsReload = true;
             break;
         }
@@ -786,44 +1002,43 @@ rfl::Variant<std::vector<lsp::CompletionItem>, lsp::CompletionList, std::monosta
         m_client.showError(fmt::format("Document {} not found", params.textDocument.uri.getPath()));
         return std::monostate{};
     }
-    char triggerChar = params.context->triggerCharacter
-                           ? params.context->triggerCharacter.value()[0]
-                           : ' ';
-
-    // Prev text including the char that was just written
-    auto prevText = doc->getPrevText(params.position);
-    char prevChar = prevText.size() >= 2 ? prevText[prevText.size() - 2] : ' ';
-    INFO("Completion triggered by: ['{}','{}']", prevChar, triggerChar);
     auto maybeLoc = doc->getLocation(params.position);
-
     if (!maybeLoc) {
         WARN("No location found for position {},{}", params.position.line,
              params.position.character);
         return std::monostate{};
     }
     auto loc = maybeLoc.value();
-    if (params.context->triggerKind == lsp::CompletionTriggerKind::Invoked) {
-        m_driver->completions.getInvokedCompletions(results, doc, loc);
-    }
-    else {
-        m_driver->completions.getTriggerCompletions(triggerChar, prevChar, doc, loc, results);
-    }
+
+    auto ctx = CompletionContext::fromLocation(*doc, loc, *params.context);
+
+    INFO("Completion: kind={} trigger='{}' query={}", toString(ctx.lspContext.triggerKind),
+         ctx.lspContext.triggerCharacter.value_or(""), toString(ctx.query->kind()));
+
+    m_driver->completions.getCompletions(results, doc, ctx);
 
     // TODO: rank results using order- the lsp is pretty stupid with this.
     // We need to hack around with client side middileware like in clangd-
     // https://github.com/clangd/vscode-clangd/blob/master/src/clangd-context.ts
 
+    if (ctx.query->isIncomplete()) {
+        // Macro results are server-filtered and bounded. Mark the list incomplete so clients ask
+        // again as the user types instead of treating omitted candidates as unavailable.
+        return lsp::CompletionList{.isIncomplete = true, .items = std::move(results)};
+    }
+
     return results;
 }
 
-lsp::CompletionItem SlangServer::getCompletionItemResolve(const lsp::CompletionItem& item) {
+lsp::CompletionItem SlangServer::getCompletionItemResolve(const lsp::CompletionItem& item,
+                                                          lsp::RequestContext ctx) {
     if (item.documentation.has_value()) {
         // Already resolved
         return item;
     }
 
     lsp::CompletionItem ret = item;
-    m_driver->completions.getCompletionItemResolve(ret);
+    m_driver->completions.getCompletionItemResolve(ret, ctx);
     return ret;
 }
 
@@ -834,14 +1049,118 @@ std::optional<std::vector<lsp::InlayHint>> SlangServer::getDocInlayHint(
         return {};
     }
     auto hints = doc->getAnalysis()->getInlayHints(params.range, m_config.inlayHints.get());
-    INFO("Providing {} inlay hints for {}", hints.size(), params.textDocument.uri.getPath());
+    INFO("Providing {} inlay hints for {}", hints.size(), doc->getWsRelativePath());
     return hints;
 }
 
+std::optional<std::vector<lsp::CodeLens>> SlangServer::getDocCodeLens(
+    const lsp::CodeLensParams& params) {
+    if (!m_driver->comp) {
+        return std::nullopt;
+    }
+    auto doc = m_driver->getDocument(params.textDocument.uri);
+    if (!doc) {
+        return std::nullopt;
+    }
+
+    std::vector<lsp::CodeLens> lenses;
+    auto& meta = doc->getSyntaxTree()->getMetadata();
+    for (const auto& [decl, _] : meta.nodeMeta) {
+        if (!decl || !decl->header) {
+            continue;
+        }
+
+        const auto& nameToken = decl->header->name;
+        auto moduleName = std::string(nameToken.valueText());
+        if (moduleName.empty()) {
+            continue;
+        }
+
+        const auto& instances = m_driver->comp->getInstancesOfModule(moduleName);
+        if (instances.empty()) {
+            continue;
+        }
+
+        // Module isn't reachable from the active build.
+        auto* activeInstance = m_driver->comp->getActiveInstanceSymbol(moduleName);
+        if (!activeInstance) {
+            continue;
+        }
+
+        std::vector<std::string> instancePaths;
+        instancePaths.reserve(instances.size());
+        for (auto* instance : instances)
+            instancePaths.push_back(instance->getHierarchicalPath());
+
+        auto range = toRange(nameToken.location(), m_driver->sm, nameToken.rawText().size());
+        auto title = fmt::format("{} ({})", activeInstance->getHierarchicalPath(),
+                                 instances.size());
+        auto selectCommand = instances.size() == 1
+                                 ? lsp::Command{
+                                       .title = title,
+                                       .tooltip = "Show active instance in hierarchy",
+                                       .command = "slang.showInHierarchy",
+                                       .arguments = std::vector<lsp::LSPAny>{
+                                           rfl::to_generic<rfl::UnderlyingEnums>(
+                                               SlangLspClient::ActivateInstanceParams{
+                                                   .hierPath = activeInstance->getHierarchicalPath(),
+                                                   .interactionSource = SlangLspClient::
+                                                       InteractionSource::codeLensSelect,
+                                               })},
+                                   }
+                                 : m_client.makeQuickPickCommand(
+                                       title, fmt::format("Select active instance for {}", moduleName),
+                                       fmt::format("Select active instance for {}", moduleName),
+                                       activeInstance->getHierarchicalPath(), instancePaths,
+                                       "slang.activateInstance",
+                                       SlangLspClient::InteractionSource::codeLensSelect);
+        lenses.push_back(lsp::CodeLens{
+            .range = range,
+            .command = std::move(selectCommand),
+        });
+        if (!activeInstance->isTopLevel()) {
+            lenses.push_back(lsp::CodeLens{
+                .range = range,
+                .command = m_client.makeActivateInstanceCommand(
+                    "Go to Instantiation", "", activeInstance->getHierarchicalPath(),
+                    SlangLspClient::InteractionSource::codeLensGotoInstantiation),
+            });
+        }
+
+        auto generateVisitor = syntax::makeSyntaxVisitor(
+            [&](auto& visitor, const syntax::LoopGenerateSyntax& loop) {
+                if (auto activeLoop = m_driver->comp->getActiveGenerateLoop(moduleName, loop)) {
+                    auto range = toRange(loop.keyword.location(), m_driver->sm,
+                                         loop.keyword.rawText().size());
+                    lenses.push_back(lsp::CodeLens{
+                        .range = range,
+                        .command = m_client.makeQuickPickCommand(
+                            activeLoop->activePath, "Select active generate iteration",
+                            "Select active generate iteration", activeLoop->activePath,
+                            activeLoop->iterationPaths, "slang.activateInstance",
+                            SlangLspClient::InteractionSource::codeLensSelect),
+                    });
+                }
+                visitor.visitDefault(loop);
+            },
+            [&](auto& visitor, const syntax::ModuleDeclarationSyntax& module) {
+                if (&module == decl)
+                    visitor.visitDefault(module);
+            });
+        generateVisitor.visit(*decl);
+    }
+
+    return lenses;
+}
+
 std::optional<std::vector<lsp::Location>> SlangServer::getDocReferences(
-    const lsp::ReferenceParams& params) {
-    return m_driver->getDocReferences(params.textDocument.uri, params.position,
-                                      params.context.includeDeclaration);
+    const lsp::ReferenceParams& params, lsp::RequestContext ctx) {
+    auto references = m_driver->getDocReferences(params.textDocument.uri, params.position,
+                                                 params.context.includeDeclaration, ctx);
+    auto doc = m_driver->getDocument(params.textDocument.uri);
+    ctx.info("Found {} references for {}", references ? references->size() : 0,
+             doc ? doc->getWsRelativePath() : params.textDocument.uri.getPath());
+    return references;
 }
 
 std::optional<lsp::WorkspaceEdit> SlangServer::getDocRename(const lsp::RenameParams& params) {

@@ -17,6 +17,7 @@
 #include "document/SlangDoc.h"
 #include "lsp/LspServer.h"
 #include "lsp/LspTypes.h"
+#include <functional>
 #include <memory>
 #include <rfl.hpp>
 #include <rfl/Generic.hpp>
@@ -44,11 +45,21 @@ protected:
     /// Created each time config/flags are changed, including switching between explore/build mode
     std::unique_ptr<ServerDriver> m_driver;
 
+    template<typename Params, typename Result>
+    void registerDesignCommand(
+        const std::string& name,
+        const std::function<Result(ServerCompilation&, const Params&)>& func) {
+        registerCommand<Params, std::optional<Result>>(
+            name, [this, func](const Params& params) -> std::optional<Result> {
+                if (!m_driver || !m_driver->comp) {
+                    return std::nullopt;
+                }
+                return func(*m_driver->comp, params);
+            });
+    }
+
     /// The diag client
     std::shared_ptr<ServerDiagClient> m_diagClient;
-
-    /// Guard to get error prints from driver
-    decltype(OS::captureOutput()) guard;
 
     /// The build file, if set. Requires the top level to already be set
     std::optional<std::string> m_buildfile;
@@ -87,15 +98,6 @@ public:
     /// @brief Configure the driver with flags from the config file
     void configureDriver(slang::driver::Driver& driver);
 
-    void driverPrintCb(std::string_view text, bool isStdout) {
-        if (isStdout) {
-            m_client.showWarning(std::string(text));
-        }
-        else {
-            m_client.showError(std::string(text));
-        }
-    }
-
     std::shared_ptr<SlangDoc> getDoc(const URI& path);
 
     SourceManager& sourceManager();
@@ -113,10 +115,15 @@ public:
     // it will require another query
     std::vector<hier::InstanceSet> getScopesByModule(const std::monostate&);
 
-    // Returns the instances of a module
+    // Returns the instances of a module plus its declaration location
     std::vector<hier::QualifiedInstance> getInstancesOfModule(const std::string moduleName);
 
-    // Returns the modules defined in a file, used for the modules view
+    bool setActiveInstance(const std::string& hierPath);
+    bool activateInstance(const SlangLspClient::ActivateInstanceParams& params,
+                          const lsp::RequestContext& ctx = {});
+    std::optional<hier::QualifiedInstance> getActiveInstance(const std::string& moduleName);
+
+    // Returns the modules defined in a file.
     std::vector<std::string> getModulesInFile(const std::string path);
 
     // Returns the files that contain a specific module, used for terminal links
@@ -124,6 +131,23 @@ public:
 
     // Return the item at this path
     std::vector<hier::HierItem_t> getScope(const std::string& hierPath);
+
+    // Return root-to-focus scope steps with child lists for each hierarchy segment.
+    std::vector<hier::ScopeStep> getScopes(const std::string& hierPath,
+                                           const lsp::RequestContext& ctx = {});
+
+    // Resolve the document location for a hierarchical path. Used by tests; the LSP command
+    // is `slang.showHierLocation`, which sends the location to the client via window/showDocument
+    // so the language client handles file://-vs-vscode-remote:// URI translation for us.
+    std::optional<lsp::Location> getHierLocation(const std::string& hierPath);
+
+    struct ShowHierLocationArgs {
+        std::string hierPath;
+        bool takeFocus = false;
+    };
+    std::monostate showHierLocation(const ShowHierLocationArgs& args);
+
+    std::monostate openModuleDefinition(const std::string& moduleName);
 
     struct ExpandMacroArgs {
         std::string src;
@@ -160,7 +184,8 @@ public:
 
     void onDocDidClose(const lsp::DidCloseTextDocumentParams&) override;
 
-    void onDocDidChange(const lsp::DidChangeTextDocumentParams&) override;
+    void onDocDidChange(const lsp::DidChangeTextDocumentParams&,
+                        lsp::RequestContext ctx = {}) override;
 
     void onDocDidSave(const lsp::DidSaveTextDocumentParams&) override;
 
@@ -198,16 +223,20 @@ public:
     rfl::Variant<std::vector<lsp::CompletionItem>, lsp::CompletionList, std::monostate>
     getDocCompletion(const lsp::CompletionParams&) override;
 
+    // Used to show the selected instance and associated buttons when a design is set
+    std::optional<std::vector<lsp::CodeLens>> getDocCodeLens(const lsp::CodeLensParams&) override;
+
     std::optional<std::vector<lsp::InlayHint>> getDocInlayHint(
         const lsp::InlayHintParams&) override;
 
     std::optional<std::vector<lsp::Location>> getDocReferences(
-        const lsp::ReferenceParams&) override;
+        const lsp::ReferenceParams&, lsp::RequestContext ctx = {}) override;
 
     std::optional<lsp::WorkspaceEdit> getDocRename(const lsp::RenameParams&) override;
 
     /// Completions resolve (get docs and snippet string)
-    lsp::CompletionItem getCompletionItemResolve(const lsp::CompletionItem&) override;
+    lsp::CompletionItem getCompletionItemResolve(const lsp::CompletionItem&,
+                                                 lsp::RequestContext ctx = {}) override;
 
     /// Get a list of highlights for all references to a symbol in the current document
     std::optional<std::vector<lsp::DocumentHighlight>> getDocDocumentHighlight(
@@ -251,7 +280,7 @@ public:
     /// Get a list of RTL paths of the loads of a given RTL path
     std::vector<std::string> getLoads(const std::string&) final;
 
-    /// Get the mutex to prevent collisions between LSP and WCP message handling
-    std::mutex& getMutex() final { return mutex; };
+    /// Get the mutex that serializes access to shared server state.
+    std::mutex& getServerStateMutex() final { return serverStateMutex; };
 };
 } // namespace server

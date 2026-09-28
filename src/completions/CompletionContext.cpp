@@ -24,6 +24,9 @@ namespace {
 
 /// Check if a syntax kind represents an expression (value context)
 bool isExpressionContext(SyntaxKind kind) {
+    if (SelectorSyntax::isKind(kind))
+        return true;
+
     switch (kind) {
         // Port connections - values
         case SyntaxKind::OrderedPortConnection:
@@ -40,9 +43,14 @@ bool isExpressionContext(SyntaxKind kind) {
         // Various expressions
         case SyntaxKind::ParenthesizedExpression:
         case SyntaxKind::InvocationExpression:
+        case SyntaxKind::ExpressionStatement:
 
         // Value initializers
         case SyntaxKind::EqualsValueClause:
+        // Macro arguments are unparsed source text from the caller. Treat them like expression
+        // positions so value completions remain available inside macro usages.
+        case SyntaxKind::MacroActualArgument:
+        case SyntaxKind::MacroActualArgumentList:
             return true;
         default:
             return false;
@@ -55,6 +63,8 @@ bool isPortListContext(SyntaxKind kind) {
         case SyntaxKind::AnsiPortList:
         case SyntaxKind::NonAnsiPortList:
         case SyntaxKind::WildcardPortList:
+        case SyntaxKind::ImplicitAnsiPort:
+        case SyntaxKind::PortDeclaration:
             return true;
         default:
             return false;
@@ -98,13 +108,16 @@ bool isProceduralBlockContext(SyntaxKind kind) {
 
 } // anonymous namespace
 
-CompletionContext CompletionContext::fromLocation(SlangDoc& doc, SourceLocation loc) {
+CompletionContext CompletionContext::fromLocation(SlangDoc& doc, SourceLocation loc,
+                                                  lsp::CompletionContext lspContext) {
     CompletionContext ctx;
+    ctx.lspContext = std::move(lspContext);
     // Hold analysis alive so that scope/syntax pointers remain valid
     // for the entire lifetime of the CompletionContext.
     ctx.analysis = doc.getAnalysis();
     ctx.scope = ctx.analysis->getScopeAt(loc);
     ctx.syntax = ctx.analysis->syntaxes.getSyntaxAt(loc);
+    ctx.query = CompletionQuery::fromLocation(doc, ctx.analysis, loc, ctx.lspContext);
 
     if (!ctx.syntax) {
         // No syntax node at location - assume module item context if we have a scope

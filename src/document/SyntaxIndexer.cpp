@@ -9,6 +9,7 @@
 #include "document/SyntaxIndexer.h"
 
 #include "util/Logging.h"
+#include <algorithm>
 
 #include "slang/parsing/Token.h"
 #include "slang/parsing/TokenKind.h"
@@ -35,7 +36,7 @@ std::string SyntaxIndexer::MacroExpansionTokens::getText() const {
 }
 
 SyntaxIndexer::SyntaxIndexer(const slang::syntax::SyntaxTree& tree) {
-    SLANG_ASSERT(tree.getSourceBufferIds().size() == 1);
+    SLANG_ASSERT(tree.getSourceBufferIds().size() >= 1);
     m_buffer = tree.getSourceBufferIds()[0];
     m_sourceManager = &tree.sourceManager();
     visit(tree.root());
@@ -54,8 +55,15 @@ void SyntaxIndexer::visit(const slang::syntax::SyntaxNode& node) {
         case syntax::SyntaxKind::InvocationExpression:
         case syntax::SyntaxKind::HierarchyInstantiation:
         case syntax::SyntaxKind::ClassName:
+        case syntax::SyntaxKind::AssignmentPatternExpression:
             collectedHints.emplace(static_cast<uint32_t>(node.getFirstToken().location().offset()),
                                    &node);
+            break;
+        case syntax::SyntaxKind::ParameterDeclaration:
+            if (node.getFirstToken().location().buffer() == m_buffer) {
+                collectedHints.emplace(
+                    static_cast<uint32_t>(node.getFirstToken().location().offset()), &node);
+            }
             break;
         default:
             break;
@@ -84,15 +92,6 @@ void SyntaxIndexer::visit(const slang::syntax::SyntaxNode& node) {
 
             if (token->location().buffer() == m_buffer &&
                 token->kind != parsing::TokenKind::Placeholder) {
-                if (collected.size() > 0) {
-                    /// TODO: investigate overlaps
-                    // SLANG_ASSERT(collected.back()->range().end() <= token->range().start());
-                    if (!(collected.back()->range().end() <= token->range().start())) {
-                        ERROR("Token '{}': {} overlaps with previous token '{}' : {}",
-                              token->rawText(), toString(token->kind), collected.back()->rawText(),
-                              toString(collected.back()->kind));
-                    }
-                }
                 collected.push_back(token);
 
                 tokenToParent[token] = &node;
@@ -132,6 +131,11 @@ void SyntaxIndexer::processTrivia(std::span<const slang::parsing::Trivia> trivia
         if (trivia.kind == parsing::TriviaKind::SkippedTokens) {
             for (const auto& skippedTok : trivia.getSkippedTokens()) {
                 processTrivia(skippedTok.trivia(), parent);
+                if (skippedTok.location().buffer() == m_buffer && !skippedTok.isMissing() &&
+                    skippedTok.kind != parsing::TokenKind::Placeholder) {
+                    collected.push_back(&skippedTok);
+                    tokenToParent[&skippedTok] = &parent;
+                }
             }
             continue;
         }
@@ -241,6 +245,26 @@ const slang::parsing::Token* SyntaxIndexer::getTokenAt(slang::SourceLocation loc
     return nullptr;
 }
 
+const slang::parsing::Token* SyntaxIndexer::getTokenBefore(slang::SourceLocation loc) const {
+    auto index = tokenIndexBefore(loc);
+    while (index >= 0 && collected[index]->location() >= loc)
+        index--;
+    if (index >= 0 && loc < collected[index]->range().end())
+        index--;
+    return index >= 0 ? collected[index] : nullptr;
+}
+
+const slang::parsing::Token* SyntaxIndexer::getTokenAfter(slang::SourceLocation loc) const {
+    if (loc.buffer() != m_buffer || collected.empty())
+        return nullptr;
+
+    auto it = std::lower_bound(collected.begin(), collected.end(), loc,
+                               [](const parsing::Token* token, SourceLocation location) {
+                                   return token->location() < location;
+                               });
+    return it != collected.end() ? *it : nullptr;
+}
+
 const syntax::SyntaxNode* SyntaxIndexer::getTokenParent(const parsing::Token* tok) const {
     auto it = tokenToParent.find(tok);
     if (it == tokenToParent.end()) {
@@ -260,7 +284,8 @@ const syntax::SyntaxNode* SyntaxIndexer::getSyntaxAt(slang::SourceLocation loc) 
     auto beforeToken = collected[beforeIndex];
 
     // Inside a token
-    if (loc < beforeToken->range().end()) {
+    if (loc < beforeToken->range().end() ||
+        (beforeToken->isMissing() && loc == beforeToken->location())) {
         return getTokenParent(beforeToken);
     }
 

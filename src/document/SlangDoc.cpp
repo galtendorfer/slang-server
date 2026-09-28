@@ -10,7 +10,9 @@
 
 #include "ServerDriver.h"
 #include "document/ShallowAnalysis.h"
+#include "lsp/RequestContext.h"
 #include "lsp/URI.h"
+#include "util/Converters.h"
 #include "util/Logging.h"
 #include "util/SlangExtensions.h"
 #include <fmt/format.h>
@@ -20,6 +22,7 @@
 #include <string_view>
 
 #include "slang/ast/Compilation.h"
+#include "slang/diagnostics/CompilationDiags.h"
 #include "slang/diagnostics/DeclarationsDiags.h"
 #include "slang/diagnostics/Diagnostics.h"
 #include "slang/diagnostics/ExpressionsDiags.h"
@@ -33,7 +36,11 @@ using namespace slang;
 
 SlangDoc::SlangDoc(ServerDriver& driver, URI uri, SourceBuffer buffer) :
     m_driver(driver), m_sourceManager(driver.sm), m_options(driver.options), m_uri(uri),
-    m_buffer(buffer) {
+    m_wsRelativePathOffset(driver.getWsRelativePathOffset(m_uri.getPath())), m_buffer(buffer) {
+}
+
+std::optional<SourceLocation> SlangDoc::getLocation(const lsp::Position& position) {
+    return toSourceLocation(m_buffer.id, position, m_sourceManager);
 }
 
 std::shared_ptr<SlangDoc> SlangDoc::fromTree(ServerDriver& driver,
@@ -96,33 +103,24 @@ std::shared_ptr<syntax::SyntaxTree> SlangDoc::getSyntaxTree() {
     return m_tree;
 }
 
-std::shared_ptr<ShallowAnalysis> SlangDoc::getAnalysis(bool refreshDependencies) {
-    if (!m_analysis || !m_analysis->hasValidBuffers() || refreshDependencies) {
-        // Load dependent documents from driver if not already loaded
-        if (m_dependentDocuments.empty() || refreshDependencies) {
-            m_dependentDocuments = m_driver.getDependentDocs(getSyntaxTree());
-        }
-
-        std::vector<std::shared_ptr<syntax::SyntaxTree>> trees = {getSyntaxTree()};
-        for (const auto& doc : m_dependentDocuments) {
-            if (auto depTree = doc->getSyntaxTree()) {
-                trees.push_back(depTree);
-            }
-        }
-        m_analysis = std::make_shared<ShallowAnalysis>(m_sourceManager, m_buffer.id, m_tree,
-                                                       m_options, trees);
-        INFO("Analyzed {} with tops: {}", m_uri.getPath(),
-             fmt::join(m_analysis->getCompilation()->getRoot().topInstances |
-                           std::views::transform([](const auto& top) { return top->name; }),
-                       ", "));
-    }
-
-    return m_analysis;
+std::shared_ptr<ShallowAnalysis> SlangDoc::refreshAnalysis(const lsp::RequestContext& ctx) {
+    ctx.throwIfCancelled("before analysis");
+    auto tree = getSyntaxTree();
+    auto trees = m_driver.getDependentTrees(tree);
+    trees.insert(trees.begin(), tree);
+    auto analysis = std::make_shared<ShallowAnalysis>(m_sourceManager, m_buffer.id, tree, m_options,
+                                                      trees, m_driver.comp.get());
+    auto topNames = analysis->getCompilation()->getRoot().topInstances |
+                    std::views::transform([](const auto& top) { return top->name; });
+    ctx.info("Analyzed {} with tops: {}", getWsRelativePath(), fmt::join(topNames, ", "));
+    m_analysis = analysis;
+    return analysis;
 }
 
-std::string SlangDoc::getPrevText(const lsp::Position& position) {
-    return std::string(
-        m_sourceManager.getLine(m_buffer.id, position.line + 1).substr(0, position.character));
+std::shared_ptr<ShallowAnalysis> SlangDoc::getAnalysis(const lsp::RequestContext& ctx) {
+    if (!m_analysis || !m_analysis->hasValidBuffers())
+        return refreshAnalysis(ctx);
+    return m_analysis;
 }
 
 bool SlangDoc::textMatches(std::string_view text) {
@@ -140,6 +138,22 @@ bool SlangDoc::textMatches(std::string_view text) {
 }
 
 void SlangDoc::onChange(const std::vector<lsp::TextDocumentContentChangeEvent>& contentChanges) {
+    // From the LSP spec:
+    //
+    // The actual content changes. The content changes describe single state changes to the
+    // document. So if there are two content changes c1 (at array index 0) and c2 (at array
+    // index 1) for a document in state S then c1 moves the document from S to S' and c2 from
+    // S' to S''. So c1 is computed on the state S and c2 is computed on the state S'.
+    //
+    // To mirror the content of a document using change events use the following approach:
+    // - start with the same initial content
+    // - apply the 'textDocument/didChange' notifications in the order you receive them.
+    // - apply the `TextDocumentContentChangeEvent`s in a single notification in the order you
+    //   receive them.
+    //
+    // Partial is defined in the variant first, so it will match first iff range and text are both
+    // present. WholeDocument will match if text is present, but only be tried second. Less specific
+    // cases are tried later.
     SmallVector<char> buffer;
     std::string_view textView = getText();
     std::vector<size_t> lineOffsets;
@@ -154,38 +168,63 @@ void SlangDoc::onChange(const std::vector<lsp::TextDocumentContentChangeEvent>& 
         SourceManager::computeLineOffsets(textView, lineOffsets);
         auto& start = range.start;
         auto& end = range.end;
-        auto startOffset = lineOffsets[start.line] + start.character;
-        auto endOffset = lineOffsets[end.line] + end.character;
         if (start.line >= lineOffsets.size() || end.line >= lineOffsets.size()) {
             throw std::runtime_error(fmt::format("Range out of bounds: {},{} / {}", start.line,
                                                  end.line, lineOffsets.size()));
         }
+        auto startOffset = lineOffsets[start.line] + start.character;
+        auto endOffset = lineOffsets[end.line] + end.character;
         return std::make_pair(startOffset, endOffset);
     };
 
+    auto ensureNullTerminated = [&]() {
+        if (buffer.empty() || buffer.back() != '\0')
+            buffer.push_back('\0');
+    };
+
     // Single change (most common)
-    auto change = rfl::get<lsp::TextDocumentContentChangePartial>(contentChanges[0]);
-    auto offsets = getOffsets(change.range);
-    // insert all parts
-    buffer.append(textView.begin(), textView.begin() + offsets.first);
-    buffer.append(change.text.begin(), change.text.end());
-    buffer.append(textView.begin() + offsets.second, textView.end());
-    if (buffer.empty() || buffer.back() != '\0')
-        buffer.push_back('\0');
+    rfl::visit(
+        [&](const auto& change) {
+            using T = std::decay_t<decltype(change)>;
+            if constexpr (std::is_same_v<T, lsp::TextDocumentContentChangePartial>) {
+                auto offsets = getOffsets(change.range);
+                buffer.append(textView.begin(), textView.begin() + offsets.first);
+                buffer.append(change.text.begin(), change.text.end());
+                buffer.append(textView.begin() + offsets.second, textView.end());
+            }
+            else {
+                buffer.append(change.text.begin(), change.text.end());
+            }
+        },
+        contentChanges[0]);
+    ensureNullTerminated();
 
     // More than one change is rare- typically things like rename actions, or if there's some lag.
     for (size_t i = 1; i < contentChanges.size(); i++) {
         textView = std::string_view{buffer.data(), buffer.size()};
-        change = rfl::get<lsp::TextDocumentContentChangePartial>(contentChanges[i]);
         lineOffsets.clear();
-        auto offsets = getOffsets(change.range);
-
-        // handle deletes
-        if (offsets.second > offsets.first) {
-            buffer.erase(buffer.begin() + offsets.first, buffer.begin() + offsets.second);
-        }
-        // handle inserts
-        buffer.insert(buffer.begin() + offsets.first, change.text.begin(), change.text.end());
+        rfl::visit(
+            [&](const auto& change) {
+                using T = std::decay_t<decltype(change)>;
+                if constexpr (std::is_same_v<T, lsp::TextDocumentContentChangePartial>) {
+                    auto offsets = getOffsets(change.range);
+                    // handle deletes
+                    if (offsets.second > offsets.first) {
+                        buffer.erase(buffer.begin() + offsets.first,
+                                     buffer.begin() + offsets.second);
+                    }
+                    // handle inserts
+                    buffer.insert(buffer.begin() + offsets.first, change.text.begin(),
+                                  change.text.end());
+                }
+                else {
+                    // WholeDocument collapses all prior changes
+                    buffer.clear();
+                    buffer.append(change.text.begin(), change.text.end());
+                    ensureNullTerminated();
+                }
+            },
+            contentChanges[i]);
     }
     m_buffer = m_sourceManager.replaceBuffer(m_buffer.id, std::move(buffer));
 
@@ -211,10 +250,9 @@ void SlangDoc::issueParseDiagnostics(DiagnosticEngine& diagEngine) {
     }
 }
 
-void SlangDoc::issueDiagnosticsTo(DiagnosticEngine& diagEngine) {
+void SlangDoc::issueDiagnosticsTo(DiagnosticEngine& diagEngine, const lsp::RequestContext& ctx) {
     // Issue compilation diagnostics
-    auto analysis = getAnalysis(true);
-    auto& shallowComp = *analysis->getCompilation();
+    auto analysis = refreshAnalysis(ctx);
 
     // Parse diags (just this tree, others will be handled by their SlangDoc objects
     for (auto& diag : getSyntaxTree()->diagnostics()) {
@@ -223,14 +261,22 @@ void SlangDoc::issueDiagnosticsTo(DiagnosticEngine& diagEngine) {
 
     // Parse and shallow compilation diagnostics
     // There will be many diags outside the buffer, like unknown modules.
-    for (auto& diag : shallowComp.getSemanticDiagnostics()) {
+    const auto& semanticDiagnostics = analysis->getSemanticDiagnostics();
+    ctx.throwIfCancelled("before publishing semantic diagnostics");
+    for (auto& diag : semanticDiagnostics) {
         if (m_sourceManager.getFullyOriginalLoc(diag.location).buffer() != m_buffer.id) {
+            continue;
+        }
+        if (diag.code == slang::diag::MaxInstanceDepthExceeded) {
             continue;
         }
         diagEngine.issue(diag);
     }
+
     // Analysis on the shallow compilation (unused, multidriven, etc)
-    for (auto& diag : analysis->getAnalysisDiags()) {
+    auto analysisDiagnostics = analysis->getAnalysisDiags();
+    ctx.throwIfCancelled("before publishing analysis diagnostics");
+    for (auto& diag : analysisDiagnostics) {
         if (m_sourceManager.getFullyOriginalLoc(diag.location).buffer() != m_buffer.id) {
             continue;
         }
@@ -238,11 +284,13 @@ void SlangDoc::issueDiagnosticsTo(DiagnosticEngine& diagEngine) {
     }
 }
 
-std::vector<lsp::Range> SlangDoc::getInactiveRegions() {
+std::vector<lsp::Range> SlangDoc::getInactiveRegions(const lsp::RequestContext& ctx) {
+    ctx.throwIfCancelled("before collecting inactive regions");
     std::vector<lsp::Range> result;
-    result.reserve(getAnalysis()->syntaxes.disabledRegions.size());
+    auto analysis = getAnalysis(ctx);
+    result.reserve(analysis->syntaxes.disabledRegions.size());
 
-    for (const auto& region : getAnalysis()->syntaxes.disabledRegions) {
+    for (const auto& region : analysis->syntaxes.disabledRegions) {
         result.push_back(toRange(region, m_sourceManager));
     }
 

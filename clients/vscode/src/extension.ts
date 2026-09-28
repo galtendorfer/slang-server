@@ -31,9 +31,24 @@ import {
   toPosix,
 } from './utils'
 import { glob } from 'glob'
+import { SlangClientInfoFeature } from './lib/clientInfo'
 import { InactiveRegionsFeature } from './lib/inactiveRegions'
 
 export var ext: SlangExtension
+
+interface QuickPickItem extends vscode.QuickPickItem {
+  value: unknown
+}
+
+interface QuickPickAction {
+  onSelectCommand: string
+  interactionSource?: slang.InteractionSource
+}
+
+interface QuickPickParams extends QuickPickAction {
+  placeholder: string
+  items: QuickPickItem[]
+}
 
 export class SlangExtension extends ActivityBarComponent {
   ////////////////////////////////////////////////
@@ -97,6 +112,40 @@ File input is sent to stdin, and formatted output is read from stdout.',
   ////////////////////////////////////////////////
   expandDir: vscode.Uri | undefined = undefined
 
+  private async executeQuickPickAction(params: QuickPickAction, value: unknown): Promise<void> {
+    if (params.interactionSource !== undefined && typeof value === 'string') {
+      await this.project.setInstance.func(value, params.interactionSource)
+      return
+    }
+
+    await vscode.commands.executeCommand(params.onSelectCommand, value)
+  }
+
+  quickPick: CommandNode = new CommandNode(
+    {
+      title: 'Quick Pick',
+    },
+    async (params: QuickPickParams) => {
+      const picked = await vscode.window.showQuickPick(params.items, {
+        placeHolder: params.placeholder,
+      })
+      if (!picked) {
+        return
+      }
+
+      await this.executeQuickPickAction(params, picked.value)
+    }
+  )
+
+  showInHierarchy: CommandNode = new CommandNode(
+    {
+      title: 'Show in Hierarchy',
+    },
+    async (params: slang.ActivateInstanceParams) => {
+      await this.project.showInHierarchy(params)
+    }
+  )
+
   rewrite: EditorButton = new EditorButton(
     {
       title: 'Expand Macros',
@@ -143,7 +192,7 @@ File input is sent to stdin, and formatted output is read from stdout.',
         githubRepo: 'hudson-trading/slang-server',
         assetNames: {
           windows: 'slang-server-windows-x64.zip',
-          linux: 'slang-server-linux-x64-gcc.tar.gz',
+          linux: 'slang-server-linux-x64.tar.gz',
           mac: 'slang-server-macos.tar.gz',
         },
       },
@@ -182,6 +231,20 @@ File input is sent to stdin, and formatted output is read from stdout.',
     }
 
     this.client = new LanguageClient('slang-server', serverOptions, clientOptions)
+    const clientInfo = {
+      name: this.context.extension.packageJSON.name as string,
+      version: this.context.extension.packageJSON.version as string,
+    }
+
+    this.client.registerFeature(new SlangClientInfoFeature(clientInfo))
+    this.context.subscriptions.push(
+      this.client.onNotification(
+        'slang/activeInstanceChanged',
+        (params: slang.ActivateInstanceParams) => {
+          void this.project.onActiveInstanceChanged(params)
+        }
+      )
+    )
 
     this.client.registerFeature(this.inactiveRegions)
     this.inactiveRegions.register(this.client)
@@ -220,9 +283,8 @@ File input is sent to stdin, and formatted output is read from stdout.',
     await this.project.onStart()
 
     // Log and check version compatibility
-    const clientVersion = vscode.extensions.getExtension('Hudson-River-Trading.vscode-slang')
-      ?.packageJSON.version
-    this.logger.info(`Using slang-vscode v${clientVersion ?? 'unknown'}`)
+    const clientVersion = clientInfo.version
+    this.logger.info(`Using ${clientInfo.name} v${clientVersion}`)
 
     const serverInfo = this.client.initializeResult?.serverInfo
     const serverFullVersion = serverInfo?.version?.trim()
@@ -463,4 +525,5 @@ export async function activate(context: vscode.ExtensionContext) {
     'eirikpre.systemverilog',
     'IMCTradingBV.svlangserver',
   ])
+  return ext
 }

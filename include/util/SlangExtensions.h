@@ -13,6 +13,10 @@
 #include "slang/syntax/SyntaxTree.h"
 #include "slang/text/SourceManager.h"
 
+namespace slang::ast {
+class Type;
+}
+
 namespace server {
 
 /// @brief Check if a syntax tree has valid (latest) buffers in the source manager
@@ -21,5 +25,11 @@ namespace server {
 /// @return true if all buffers in the tree are up-to-date
 bool hasValidBuffers(const slang::SourceManager& sm,
                      const std::shared_ptr<slang::syntax::SyntaxTree>& tree);
+
+/// Return the canonical type, unwrapping a recoverable error type when available.
+const slang::ast::Type& unwrapErrorType(const slang::ast::Type& type);
+
+/// Return the resolved target of an alias introduced by a type parameter.
+const slang::ast::Type* getTypeParameterTargetType(const slang::ast::Type& type);
 
 } // namespace server

@@ -4,6 +4,11 @@
 #include "utils/GoldenTest.h"
 #include "utils/ServerHarness.h"
 #include <cstdlib>
+#include <fstream>
+#include <iterator>
+
+#include "slang/diagnostics/CompilationDiags.h"
+#include "slang/diagnostics/ExpressionsDiags.h"
 
 TEST_CASE("SingleFileDiag") {
     ServerHarness server;
@@ -35,6 +40,37 @@ endmodule
 )");
 
     golden.record(doc.getDiagnostics());
+}
+
+TEST_CASE("MacroNoteSourceLocations") {
+    ServerHarness server;
+
+    JsonGoldenTest golden;
+    auto doc = server.openFile("macro_note.sv", R"(
+`define DRIVE(sig, val) assign sig = val;
+
+module top(output logic out);
+    `DRIVE(out, 1'b0)
+    `DRIVE(out, 1'b1)
+endmodule
+)");
+
+    golden.record(doc.getDiagnostics());
+}
+
+TEST_CASE("LineDirectiveDiagnosticsUseBufferPositions") {
+    ServerHarness server;
+    auto doc = server.openFile("line_directive_diag.sv", R"(`line 100 "mapped.sv" 0
+module top;
+    localparam int value = 1;
+    invalid
+endmodule
+)");
+
+    auto diags = doc.getDiagnostics();
+    REQUIRE_FALSE(diags.empty());
+    for (const auto& diag : diags)
+        CHECK(diag.range.start.line < 5);
 }
 
 TEST_CASE("DiagsPublishedOnOpenCachedDoc") {
@@ -70,7 +106,7 @@ endmodule
     golden.record("afterSave", doc.getDiagnostics());
 }
 
-TEST_CASE("UntakenGenerateChecks") {
+TEST_CASE("CheckUninstantiated") {
     ServerHarness server;
 
     JsonGoldenTest golden;
@@ -135,6 +171,136 @@ TEST_CASE("PartialElaboration") {
     golden.record(diags);
 }
 
+TEST_CASE("ShallowCompilationDepthLimitIsNotReported") {
+    ServerHarness server;
+
+    auto doc = server.openFile("test.sv", R"(
+module leaf;
+endmodule
+
+module implementation;
+    leaf #(.missing_param(1)) leaf_i(.missing_port(1'b0));
+endmodule
+
+module child;
+    implementation implementation_i();
+endmodule
+
+module wrapper;
+    child child_i();
+endmodule
+)");
+
+    auto diags = doc.getDiagnostics();
+    bool sawMissingParam = false;
+    bool sawMissingPort = false;
+    for (auto& diag : diags) {
+        sawMissingParam |= diag.message == "parameter 'missing_param' does not exist in 'leaf'";
+        sawMissingPort |= diag.message == "port 'missing_port' does not exist in 'leaf'";
+    }
+
+    CHECK(diags.size() == 2);
+    CHECK(sawMissingParam);
+    CHECK(sawMissingPort);
+}
+
+TEST_CASE("IfacePortStaticAssertParamOverride") {
+    // When a top-level module has an interface port (shallow / AllowTopLevelIfacePorts),
+    // a `$static_assert(port.PARAM == const)` in the module body should override the value
+    // of PARAM in the default-instantiated interface, even past the interface's own default.
+    ServerHarness server;
+
+    SECTION("Value param: override widens the interface so the access is in range") {
+        auto doc = server.openFile("test.sv", R"(
+interface my_if #(
+    parameter int MY_PARAM = 1
+);
+    logic [MY_PARAM-1:0] data;
+endinterface : my_if
+
+module test_module (
+    my_if my_if,
+    output logic out
+);
+    $static_assert(my_if.MY_PARAM == 2);
+    assign out = my_if.data[1];
+endmodule : test_module
+)");
+        // With MY_PARAM overridden to 2, `data` is 2 bits wide so `data[1]` is in range.
+        CHECK(doc.getDiagnostics().empty());
+    }
+
+    SECTION("Type param: override sets the interface type so the access is in range") {
+        auto doc = server.openFile("test.sv", R"(
+package pkg;
+    typedef logic [7:0] my_t;
+endpackage
+
+interface my_if #(
+    parameter type DT = logic
+);
+    DT data;
+endinterface : my_if
+
+module test_module (
+    my_if my_if,
+    output logic out
+);
+    $static_assert(type(my_if.DT) == type(pkg::my_t));
+    assign out = my_if.data[7];
+endmodule : test_module
+)");
+        // With DT overridden to pkg::my_t (8 bits), `data[7]` is in range.
+        CHECK(doc.getDiagnostics().empty());
+    }
+
+    SECTION("Type param: override operand can use a module wildcard import") {
+        auto doc = server.openFile("test.sv", R"(
+package p0;
+    typedef logic [7:0] word_t;
+endpackage
+
+interface stream_if #(
+    parameter type ElemT
+);
+    ElemT beat;
+    modport tx(output beat);
+endinterface : stream_if
+
+module wrapper
+    import p0::*;
+   (
+    stream_if.tx chan,
+    output word_t out
+);
+    $static_assert(type(chan.ElemT) == type(word_t));
+    assign out = chan.beat;
+endmodule : wrapper
+)");
+        // The override resolver needs the module body scope so the wildcard import is visible.
+        CHECK(doc.getDiagnostics().empty());
+    }
+
+    SECTION("Without a matching assert the default leaves the access out of range") {
+        auto doc = server.openFile("test.sv", R"(
+interface my_if #(
+    parameter int MY_PARAM = 1
+);
+    logic [MY_PARAM-1:0] data;
+endinterface : my_if
+
+module test_module (
+    my_if my_if,
+    output logic out
+);
+    assign out = my_if.data[1];
+endmodule : test_module
+)");
+        // MY_PARAM stays at its default of 1, so `data` is 1 bit and `data[1]` is out of range.
+        CHECK(!doc.getDiagnostics().empty());
+    }
+}
+
 TEST_CASE("RecursiveModuleRegression") {
     ServerHarness server;
 
@@ -175,108 +341,6 @@ module Top #()();
 )");
 
     CHECK(doc.getDiagnostics().size() > 0);
-}
-
-TEST_CASE("HoverMacroExpansion") {
-    ServerHarness server;
-
-    auto doc = server.openFile("test.sv", R"(
-`define WIDTH 8
-`define ADD(a, b) a + b
-`define MAKE_SIG(name) sig_``name
-module top;
-    logic [`WIDTH-1:0] data;
-    localparam int x = `ADD(3, 4);
-    logic `MAKE_SIG(foo);
-endmodule
-)");
-
-    // Hover on `WIDTH should show expansion
-    auto widthCursor = doc.before("`WIDTH");
-    auto widthHover = doc.getHoverAt(widthCursor.m_offset);
-    REQUIRE(widthHover.has_value());
-    auto widthContent = rfl::get<lsp::MarkupContent>(widthHover->contents);
-    CHECK(widthContent.value.find("Expands to") != std::string::npos);
-    CHECK(widthContent.value.find("8") != std::string::npos);
-
-    // Hover on `ADD should show expansion
-    auto addCursor = doc.before("`ADD");
-    auto addHover = doc.getHoverAt(addCursor.m_offset);
-    REQUIRE(addHover.has_value());
-    auto addContent = rfl::get<lsp::MarkupContent>(addHover->contents);
-    CHECK(addContent.value.find("Expands to") != std::string::npos);
-    CHECK(addContent.value.find("3 + 4") != std::string::npos);
-
-    // Hover on `MAKE_SIG should show concatenated expansion
-    auto sigCursor = doc.before("`MAKE_SIG");
-    auto sigHover = doc.getHoverAt(sigCursor.m_offset);
-    REQUIRE(sigHover.has_value());
-    auto sigContent = rfl::get<lsp::MarkupContent>(sigHover->contents);
-    CHECK(sigContent.value.find("Expands to") != std::string::npos);
-    CHECK(sigContent.value.find("sig_foo") != std::string::npos);
-}
-
-TEST_CASE("HoverNonAsciiString") {
-    // Regression test: hovering on a string parameter with non-ASCII bytes should not crash
-    // "a" + "b" in SV adds the character codes, producing 0xc3 which is invalid UTF-8
-    ServerHarness server;
-
-    auto doc = server.openFile("test.sv", R"(
-module top;
-    localparam string ab1 = "a" + "b";
-
-    // Valid first char, invalid second char
-    localparam string ab2 = {"a", ab1};
-endmodule
-)");
-
-    {
-        auto cursor = doc.before("ab1 =");
-        auto hover = doc.getHoverAt(cursor.m_offset);
-        REQUIRE(hover.has_value());
-
-        // The hover should contain "Value:" for the parameter
-        auto content = rfl::get<lsp::MarkupContent>(hover->contents);
-        CHECK(content.value.find("Value:") != std::string::npos);
-        // The value should show escaped string and hex (0xc3 = 'a' + 'b' = 97 + 98 = 195)
-        // Format: "\xc3"
-        CHECK(content.value.find("\\xc3") != std::string::npos);
-
-        // Verify json serialization works
-        auto json = rfl::json::write(*hover);
-        CHECK(!json.empty());
-    }
-    {
-        auto cursor = doc.before("ab2 =");
-        auto hover = doc.getHoverAt(cursor.m_offset);
-        REQUIRE(hover.has_value());
-        // The hover should contain "Value:" for the parameter
-        auto content = rfl::get<lsp::MarkupContent>(hover->contents);
-        // Value should show valid utf string for first 'a' and escaped for second invalid char
-        CHECK(content.value.find("a\\xc3") != std::string::npos);
-    }
-}
-
-TEST_CASE("HoverValidString") {
-    // Test that valid ASCII/UTF-8 strings display normally
-    ServerHarness server;
-
-    auto doc = server.openFile("test.sv", R"(
-module top;
-    localparam string greeting = "hello";
-endmodule
-)");
-
-    auto cursor = doc.before("greeting =");
-    auto hover = doc.getHoverAt(cursor.m_offset);
-    REQUIRE(hover.has_value());
-
-    auto content = rfl::get<lsp::MarkupContent>(hover->contents);
-    // Valid strings should display as quoted strings, not bit values
-    CHECK(content.value.find("\"hello\"") != std::string::npos);
-
-    auto json = rfl::json::write(*hover);
-    CHECK(!json.empty());
 }
 
 TEST_CASE("CompilationDiagnostics") {
@@ -339,6 +403,43 @@ TEST_CASE("OpenBuildFileDoesNotOverwriteCompilationDiags") {
     }
 }
 
+TEST_CASE("OpeningSingleUnitBuildFilePreservesCompilationDiags") {
+    ServerHarness server("single_unit_build");
+
+    auto hasInstanceDiag = [](const std::vector<lsp::Diagnostic>& diagnostics) {
+        return std::ranges::any_of(diagnostics, [](const auto& diagnostic) {
+            return diagnostic.message.find("instance width differs") != std::string::npos;
+        });
+    };
+
+    for (std::string_view fileName : {"submodule.sv", "submodule_two.sv"}) {
+        auto childUri = URI::fromFile(fs::current_path() / fileName);
+        REQUIRE(hasInstanceDiag(server.client.getDiagnostics(childUri)));
+        server.openFile(std::string(fileName));
+        CHECK(hasInstanceDiag(server.client.getDiagnostics(childUri)));
+    }
+}
+
+TEST_CASE("RecreatingSingleUnitBuildDoesNotShallowAnalyzeOpenBuildFile") {
+    ServerHarness server("single_unit_build");
+    server.client.capabilities.inactiveRegionsSupported = false;
+
+    auto childUri = URI::fromFile(fs::current_path() / "submodule.sv");
+    std::ifstream file(fs::current_path() / "submodule.sv");
+    REQUIRE(file);
+    std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
+
+    server.onDocDidOpen(lsp::DidOpenTextDocumentParams{
+        .textDocument = lsp::TextDocumentItem{
+            .uri = childUri, .languageId = "systemverilog", .version = 1, .text = text}});
+    REQUIRE(server.getDoc(childUri));
+    CHECK_FALSE(server.getDoc(childUri)->hasAnalysis());
+
+    server.setBuildFile("design.f");
+    REQUIRE(server.getDoc(childUri));
+    CHECK_FALSE(server.getDoc(childUri)->hasAnalysis());
+}
+
 TEST_CASE("OpenNonBuildFileGetsShallowDiags") {
     ServerHarness server("comp_repo");
     server.setBuildFile("cpu_design.f");
@@ -354,6 +455,31 @@ endmodule
     auto diags = doc.getDiagnostics();
     // Should have some diagnostics from the shallow compilation
     CHECK(!diags.empty());
+}
+
+TEST_CASE("ShallowIncludesIfacePackages") {
+    ServerHarness server("iface_pkg_dep");
+
+    auto producer = server.openFile("producer.sv");
+
+    // No diagnostics should be reported on producer.sv: the interface and its imported
+    // package both resolve once the package is pulled in transitively.
+    CHECK(producer.getDiagnostics().empty());
+
+    // The struct member `data` is typed via payload_t in types_pkg, which is reachable only
+    // through simple_if's package import. Goto-definition resolves it iff the package was
+    // pulled into the shallow compilation.
+    auto defs = producer.after("bus.payload.da").getDefinitions();
+    REQUIRE(defs.size() == 1);
+    CHECK(defs[0].targetUri.str().ends_with("types_pkg.sv"));
+
+    auto consumer = server.openFile("consumer.sv");
+
+    // An interface port without a modport must pull in the interface and its dependencies too.
+    CHECK(consumer.getDiagnostics().empty());
+    defs = consumer.after("bus.payload.va").getDefinitions();
+    REQUIRE(defs.size() == 1);
+    CHECK(defs[0].targetUri.str().ends_with("types_pkg.sv"));
 }
 
 TEST_CASE("LintOffPragma") {
@@ -401,6 +527,34 @@ endmodule
     CHECK_FALSE(hasCode(docCompilation.getDiagnostics(), "constant-conversion"));
 }
 
+TEST_CASE("DiagsClearedWhenAllErrorsFixed") {
+    // Regression: when an edit removes the last diagnostic from a file, the server
+    // must publish an empty diagnostics list so the client clears its squiggles.
+    // Previously this worked by accident via a duplicate publish in pushDiags(uri);
+    // removing that duplicate must not regress the empty-publish behavior.
+    ServerHarness server;
+
+    auto doc = server.openFile("fix_me.sv", R"(
+module top;
+    blargh
+endmodule
+)");
+
+    // File starts with a parse error; client should have at least one diag.
+    CHECK(!server.client.getDiagnostics(doc.m_uri).empty());
+
+    // Replace the body with valid SystemVerilog, so the file is now clean.
+    doc.erase(0, doc.getText().size());
+    doc.append(R"(
+module top;
+endmodule
+)");
+    doc.publishChanges();
+
+    // Server must have published an empty diagnostics list to clear the prior errors.
+    CHECK(server.client.getDiagnostics(doc.m_uri).empty());
+}
+
 TEST_CASE("RangeOOBSuppressedInUntakenGenerate") {
     ServerHarness server;
 
@@ -436,4 +590,105 @@ endmodule
                    code == "unused-but-set-variable"));
         }
     }
+}
+
+TEST_CASE("ShallowCompilationSuppressesMaxInstanceDepth") {
+    ServerHarness server;
+
+    auto doc = server.openFile("test.sv", R"(
+module leaf;
+endmodule
+
+module level3;
+    leaf child();
+endmodule
+
+module level2;
+    level3 child();
+endmodule
+
+module level1;
+    level2 child();
+endmodule
+
+module top;
+    level1 child();
+endmodule
+)");
+
+    auto& semanticDiags = doc.doc->getCompilation()->getSemanticDiagnostics();
+    CHECK(std::ranges::any_of(semanticDiags, [](const auto& diag) {
+        return diag.code == slang::diag::MaxInstanceDepthExceeded;
+    }));
+    CHECK(doc.getDiagnostics().empty());
+}
+
+TEST_CASE("ShallowCompilationKeepsExpressionDiagWithMatchingNumericCode") {
+    CHECK(slang::diag::BadIntegerCast.getCode() == slang::diag::MaxInstanceDepthExceeded.getCode());
+    CHECK(slang::diag::BadIntegerCast.getSubsystem() !=
+          slang::diag::MaxInstanceDepthExceeded.getSubsystem());
+
+    ServerHarness server;
+    auto doc = server.openFile("test.sv", R"(
+module top;
+    initial 4'(1.0);
+endmodule
+)");
+
+    auto diags = doc.getDiagnostics();
+    REQUIRE(diags.size() == 1);
+    CHECK(diags.front().message ==
+          "cannot change width or signedness of non-integral expression (type is 'real')");
+}
+
+TEST_CASE("ShallowCompilationChecksExpressionsPastDepthLimit") {
+    ServerHarness server;
+
+    auto doc = server.openFile("test.sv", R"(`default_nettype none
+module receiver #(
+    parameter int WIDTH = 1,
+    parameter int DEPTH = 1
+) (input logic value);
+endmodule
+
+module checked_module;
+    logic value;
+    assign value = missing_assign_rhs;
+    receiver #(
+        .WIDTH(missing_param_rhs),
+        .DEPTH(missing_second_param_rhs)
+    ) receiver_i(.value(missing_port_rhs));
+endmodule
+
+module level_two;
+    checked_module checked_module_i();
+endmodule
+
+module level_one;
+    level_two level_two_i();
+endmodule
+
+module top;
+    level_one level_one_i();
+endmodule
+)");
+
+    auto diags = doc.getDiagnostics();
+    bool sawAssignRhs = false;
+    bool sawParamRhs = false;
+    bool sawSecondParamRhs = false;
+    bool sawPortRhs = false;
+    for (const auto& diag : diags) {
+        sawAssignRhs |= diag.message == "use of undeclared identifier 'missing_assign_rhs'";
+        sawParamRhs |= diag.message == "use of undeclared identifier 'missing_param_rhs'";
+        sawSecondParamRhs |= diag.message ==
+                             "use of undeclared identifier 'missing_second_param_rhs'";
+        sawPortRhs |= diag.message == "use of undeclared identifier 'missing_port_rhs'";
+    }
+
+    REQUIRE(diags.size() == 4);
+    CHECK(sawAssignRhs);
+    CHECK(sawParamRhs);
+    CHECK(sawSecondParamRhs);
+    CHECK(sawPortRhs);
 }

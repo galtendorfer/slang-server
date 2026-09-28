@@ -3,14 +3,19 @@
 
 #include "util/Formatting.h"
 
+#include "Config.h"
 #include "lsp/LspTypes.h"
+#include "util/Markdown.h"
+#include "util/SlangExtensions.h"
 #include <cctype>
 #include <fmt/format.h>
 #include <sstream>
 #include <string>
 
+#include "slang/ast/symbols/MemberSymbols.h"
 #include "slang/ast/symbols/PortSymbols.h"
 #include "slang/ast/symbols/ValueSymbol.h"
+#include "slang/ast/types/DeclaredType.h"
 #include "slang/ast/types/Type.h"
 #include "slang/ast/types/TypePrinter.h"
 #include "slang/numeric/ConstantValue.h"
@@ -24,6 +29,10 @@
 
 namespace server {
 using namespace slang;
+
+namespace {
+std::string escapeInvalidUtf8(std::string_view s);
+}
 
 void stripBlankLines(std::string& s) {
     auto firstTok = std::find_if(s.begin(), s.end(), [](unsigned char ch) {
@@ -179,14 +188,29 @@ std::string detailFormat(const syntax::SyntaxNode& node) {
     return res;
 }
 
+std::optional<std::string> getDeclaredTypeString(const ast::ValueSymbol& value) {
+    auto declaredType = value.getDeclaredType();
+    auto* syntax = declaredType->getResolvedTypeSyntax();
+    if (!syntax)
+        return std::nullopt;
+
+    auto result = detailFormat(*syntax);
+    if (auto* dimensions = declaredType->getDimensionSyntax(); dimensions && !dimensions->empty()) {
+        result += " ";
+        for (auto* dimension : *dimensions)
+            result += detailFormat(*dimension);
+    }
+    if (result.empty())
+        return std::nullopt;
+    return result;
+}
+
 /// Copied from `Slang::SyntaxPrinter::printLeadingComments` with minor adjustments
 /// Licensed under MIT; see external/slang/LICENSE
-std::optional<std::span<const parsing::Trivia>::iterator> findLeadingDocCommentStart(
-    const syntax::SyntaxNode& node) {
+std::optional<size_t> findLeadingDocCommentStart(const syntax::SyntaxNode& node) {
     auto triviaSpan = node.getFirstToken().trivia();
-    using Iterator = std::span<const parsing::Trivia>::iterator;
-    std::optional<Iterator> lastComment;
-    std::optional<Iterator> leadingCommentStart;
+    std::optional<size_t> lastComment;
+    std::optional<size_t> leadingCommentStart;
 
     // Walk backwards through trivia until
     // - block comment
@@ -194,8 +218,9 @@ std::optional<std::span<const parsing::Trivia>::iterator> findLeadingDocCommentS
     // This misses leading trivia at first line, although that's typically for license/file
     auto findDocBoundary = [&]() {
         bool lastIsNewline = false;
-        for (auto it = triviaSpan.rbegin(); it != triviaSpan.rend(); it++) {
-            const auto& trivia = *it;
+        for (size_t i = triviaSpan.size(); i > 0; --i) {
+            const size_t triviaIndex = i - 1;
+            const auto& trivia = triviaSpan[triviaIndex];
             switch (trivia.kind) {
                 case parsing::TriviaKind::EndOfLine:
                     if (lastIsNewline && lastComment) {
@@ -207,10 +232,10 @@ std::optional<std::span<const parsing::Trivia>::iterator> findLeadingDocCommentS
                     break;
                 case parsing::TriviaKind::BlockComment:
                     // the first block comment is the start
-                    leadingCommentStart = it.base() - 1;
+                    leadingCommentStart = triviaIndex;
                     return;
                 case parsing::TriviaKind::LineComment:
-                    lastComment = it.base() - 1;
+                    lastComment = triviaIndex;
                     [[fallthrough]];
                 default:
                     lastIsNewline = false;
@@ -222,7 +247,16 @@ std::optional<std::span<const parsing::Trivia>::iterator> findLeadingDocCommentS
     return leadingCommentStart;
 }
 
-std::string stripDocComment(const syntax::SyntaxNode& node) {
+inline void rtrim(std::string& s) {
+    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); })
+                .base(),
+            s.end());
+}
+
+std::string getDocCommentForHover(const syntax::SyntaxNode& node,
+                                  const Config::HoverConfig::DocCommentFormat format) {
+    SLANG_ASSERT(format != Config::HoverConfig::DocCommentFormat::raw);
+
     auto triviaSpan = node.getFirstToken().trivia();
     auto start = findLeadingDocCommentStart(node);
     if (!start)
@@ -263,7 +297,13 @@ std::string stripDocComment(const syntax::SyntaxNode& node) {
 
         const bool hasText = !line.empty();
 
-        fmt::format_to(fmt::appender(out), "{}", line);
+        if (format == Config::HoverConfig::DocCommentFormat::plaintext) {
+            const std::string escaped = markup::escapeMarkdownLine(line);
+            fmt::format_to(fmt::appender(out), "{}", escaped);
+        }
+        else {
+            fmt::format_to(fmt::appender(out), "{}", line);
+        }
 
         // Force markdown to respect newlines by replacing `\n` with `  \n`
         if (hasText) {
@@ -274,7 +314,8 @@ std::string stripDocComment(const syntax::SyntaxNode& node) {
         }
     };
 
-    for (auto it = *start; it != triviaSpan.end(); ++it) {
+    for (auto it = triviaSpan.begin() + static_cast<std::ptrdiff_t>(*start); it != triviaSpan.end();
+         ++it) {
         const auto& t = *it;
 
         if (t.kind == parsing::TriviaKind::LineComment) {
@@ -322,7 +363,7 @@ std::string stripDocComment(const syntax::SyntaxNode& node) {
 }
 
 std::string svCodeBlockString(std::string_view code) {
-    auto res = std::string{code};
+    auto res = escapeInvalidUtf8(code);
     stripBlankLines(res);
     shiftIndent(res);
     // We use quad backticks since in sv triple can be used for macro concatenations
@@ -330,13 +371,17 @@ std::string svCodeBlockString(std::string_view code) {
 }
 
 lsp::MarkupContent svCodeBlock(const std::string_view code) {
-    return lsp::MarkupContent{.kind = lsp::MarkupKind::make<"markdown">(),
+    return lsp::MarkupContent{.kind = lsp::MarkupKindOptions::from_name<"markdown">().str(),
                               .value = svCodeBlockString(code)};
 }
 
 const syntax::SyntaxNode& selectDisplayNode(const syntax::SyntaxNode& node) {
     const syntax::SyntaxNode* fmtNode = &node;
     switch (node.kind) {
+        // Directives live as trivia on the following token, so their syntax parent is the
+        // next declaration in the file — not a semantic parent. Skip typedef promotion.
+        case syntax::SyntaxKind::DefineDirective:
+            return node;
         // Adjust these to just be the header
         case syntax::SyntaxKind::ModuleDeclaration:
         case syntax::SyntaxKind::ProgramDeclaration:
@@ -360,12 +405,6 @@ const syntax::SyntaxNode& selectDisplayNode(const syntax::SyntaxNode& node) {
     }
 
     return *fmtNode;
-}
-
-inline void rtrim(std::string& s) {
-    s.erase(std::find_if(s.rbegin(), s.rend(), [](unsigned char ch) { return !std::isspace(ch); })
-                .base(),
-            s.end());
 }
 
 std::string formatDocComment(const syntax::SyntaxNode& node) {
@@ -397,6 +436,13 @@ std::string formatCode(const syntax::SyntaxNode& node) {
     return res;
 }
 
+std::string formatCodeWithLeadingComments(const syntax::SyntaxNode& node) {
+    auto res = slang::syntax::SyntaxPrinter().printWithLeadingComments(node).str();
+    stripBlankLines(res);
+    shiftIndent(res);
+    return res;
+}
+
 std::string svCodeBlockString(const syntax::SyntaxNode& node) {
     const auto& fmtNode = selectDisplayNode(node);
     const auto res = formatDocComment(fmtNode) + formatCode(fmtNode);
@@ -404,7 +450,7 @@ std::string svCodeBlockString(const syntax::SyntaxNode& node) {
 }
 
 lsp::MarkupContent svCodeBlock(const syntax::SyntaxNode& node) {
-    return lsp::MarkupContent{.kind = lsp::MarkupKind::make<"markdown">(),
+    return lsp::MarkupContent{.kind = lsp::MarkupKindOptions::from_name<"markdown">().str(),
                               .value = svCodeBlockString(node)};
 }
 
@@ -465,24 +511,23 @@ std::string toCamelCase(std::string_view str) {
     return result;
 }
 
-template<bool ForHover>
-std::string getTypeStringImpl(const ast::Type& declType) {
-    if (declType.isError()) {
+std::string getTypeString(const ast::Type& declType, TypeStringMode mode) {
+    auto& type = unwrapErrorType(declType);
+    if (type.isError()) {
         return "Incomplete type";
     }
 
     slang::ast::TypePrinter printer;
-    if constexpr (ForHover) {
-        printer.options.quoteChar = '`';
+    if (mode != TypeStringMode::Canonical) {
+        if (mode == TypeStringMode::FriendlyMarkdownQuoted)
+            printer.options.quoteChar = '`';
         printer.options.anonymousTypeStyle = ast::TypePrintingOptions::FriendlyName;
     }
     printer.options.elideScopeNames = true;
     printer.options.skipTypeDefs = true;
     printer.options.printAKA = true;
     printer.options.printIntegralRange = true;
-    printer.append(declType);
-
-    auto& type = declType.getCanonicalType();
+    printer.append(declType.kind == ast::SymbolKind::ErrorType ? type : declType);
 
     if (type.isStruct() || type.isUnion() || type.isEnum()) {
         auto kindStr = toString(type.kind);
@@ -493,9 +538,6 @@ std::string getTypeStringImpl(const ast::Type& declType) {
         return printer.toString();
     }
 }
-
-template std::string getTypeStringImpl<true>(const ast::Type& declType);
-template std::string getTypeStringImpl<false>(const ast::Type& declType);
 
 std::string portString(ast::ArgumentDirection dir) {
     switch (dir) {
@@ -513,48 +555,37 @@ std::string portString(ast::ArgumentDirection dir) {
     return "unknown";
 }
 
-template<bool ForHover>
-std::string getTypeStringImpl(const ast::ValueSymbol& value) {
+std::string getTypeString(const ast::ValueSymbol& value, TypeStringMode mode) {
     const slang::ast::Type& decl = value.getType();
+    if (auto* modportPort = value.as_if<ast::ModportPortSymbol>()) {
+        return fmt::format("{} {}", portString(modportPort->direction), getTypeString(decl, mode));
+    }
     auto port = value.getFirstPortBackref();
     if (port) {
-        return fmt::format("{} {}", portString(port->port->direction),
-                           getTypeStringImpl<ForHover>(decl));
+        return fmt::format("{} {}", portString(port->port->direction), getTypeString(decl, mode));
     }
-    return getTypeStringImpl<ForHover>(decl);
+    return getTypeString(decl, mode);
 }
 
-template std::string getTypeStringImpl<true>(const ast::ValueSymbol& value);
-template std::string getTypeStringImpl<false>(const ast::ValueSymbol& value);
+namespace {
 
-bool isValidUtf8(std::string_view s) {
-    size_t i = 0;
-    while (i < s.size()) {
-        unsigned char c = static_cast<unsigned char>(s[i]);
-        int seqLen = utf8Len(c);
+size_t validUtf8SequenceLength(std::string_view s) {
+    if (s.empty())
+        return 0;
 
-        // utf8Len returns 0 for invalid leading bytes
-        if (seqLen == 0) {
-            return false;
-        }
+    auto sequenceLength = utf8Len(static_cast<unsigned char>(s.front()));
+    if (sequenceLength == 0 || s.size() < static_cast<size_t>(sequenceLength))
+        return 0;
 
-        // Check if we have enough bytes remaining
-        if (i + seqLen > s.size()) {
-            return false;
-        }
+    char bytes[4]{};
+    for (size_t i = 0; i < std::min(s.size(), sizeof(bytes)); i++)
+        bytes[i] = s[i];
 
-        // Validate continuation bytes (must be 10xxxxxx)
-        for (int j = 1; j < seqLen; j++) {
-            unsigned char cont = static_cast<unsigned char>(s[i + j]);
-            if ((cont & 0xC0) != 0x80) {
-                return false;
-            }
-        }
-
-        i += seqLen;
-    }
-
-    return true;
+    uint32_t codePoint;
+    int error;
+    int decodedLength;
+    utf8Decode(bytes, &codePoint, &error, decodedLength);
+    return error ? 0 : static_cast<size_t>(decodedLength);
 }
 
 // Escape invalid UTF-8 bytes as \xNN, preserving valid ASCII/UTF-8
@@ -564,39 +595,13 @@ std::string escapeInvalidUtf8(std::string_view s) {
 
     size_t i = 0;
     while (i < s.size()) {
-        unsigned char c = static_cast<unsigned char>(s[i]);
-        int seqLen = utf8Len(c);
-
-        // utf8Len returns 0 for invalid leading bytes
-        if (seqLen == 0) {
-            result += fmt::format("\\x{:02x}", c);
-            i++;
-            continue;
-        }
-
-        // Check if we have enough bytes remaining
-        if (i + static_cast<size_t>(seqLen) > s.size()) {
-            result += fmt::format("\\x{:02x}", c);
-            i++;
-            continue;
-        }
-
-        // Validate continuation bytes (must be 10xxxxxx)
-        bool valid = true;
-        for (int j = 1; j < seqLen; j++) {
-            unsigned char cont = static_cast<unsigned char>(s[i + j]);
-            if ((cont & 0xC0) != 0x80) {
-                valid = false;
-                break;
-            }
-        }
-
-        if (valid) {
-            result.append(s.substr(i, seqLen));
-            i += seqLen;
+        auto sequenceLength = validUtf8SequenceLength(s.substr(i));
+        if (sequenceLength) {
+            result.append(s.substr(i, sequenceLength));
+            i += sequenceLength;
         }
         else {
-            result += fmt::format("\\x{:02x}", c);
+            result += fmt::format("\\x{:02x}", static_cast<unsigned char>(s[i]));
             i++;
         }
     }
@@ -604,7 +609,26 @@ std::string escapeInvalidUtf8(std::string_view s) {
     return result;
 }
 
+} // namespace
+
+bool isValidUtf8(std::string_view s) {
+    size_t i = 0;
+    while (i < s.size()) {
+        auto sequenceLength = validUtf8SequenceLength(s.substr(i));
+        if (!sequenceLength)
+            return false;
+        i += sequenceLength;
+    }
+    return true;
+}
+
 std::string formatConstantValue(const ConstantValue& value) {
+    if (value.isInteger()) {
+        const auto& integer = value.integer();
+        if (integer.getBitWidth() == 1 && !integer.hasUnknown())
+            return value.isTrue() ? "1" : "0";
+    }
+
     if (value.isString()) {
         const auto& str = value.str();
         if (isValidUtf8(str)) {
@@ -616,7 +640,7 @@ std::string formatConstantValue(const ConstantValue& value) {
             return escapeInvalidUtf8(str);
         }
     }
-    // For non-string values, use default toString
+    // For other values, use default toString
     return value.toString();
 }
 

@@ -29,7 +29,7 @@ public:
         });
     }
 
-    void showWarning(const std::string& message) {
+    virtual void showWarning(const std::string& message) {
         std::cerr << "Warning Notif: " << message << '\n';
         onWindowShowMessage(lsp::ShowMessageParams{
             .type = lsp::MessageType::Warning,
@@ -197,5 +197,15 @@ public:
     virtual void onShowDocument(const ShowDocumentParams& params) {
         sendRequest("window/showDocument", rfl::to_generic<rfl::UnderlyingEnums>(params));
     };
+
+    /// Ask the client to refresh all inlay hints.
+    virtual void onWorkspaceInlayHintRefresh(std::monostate params = {}) {
+        sendRequest("workspace/inlayHint/refresh", rfl::to_generic(params));
+    }
+
+    /// Ask the client to refresh all code lenses.
+    virtual void onWorkspaceCodeLensRefresh(std::monostate params = {}) {
+        sendRequest("workspace/codeLens/refresh", rfl::to_generic(params));
+    }
 };
 } // namespace lsp

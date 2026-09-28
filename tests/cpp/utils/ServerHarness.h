@@ -5,6 +5,7 @@
 
 #include "ClientHarness.h"
 #include "GoldenTest.h"
+#include "ServerDriver.h"
 #include "SlangServer.h"
 #include "Utils.h"
 #include "document/ShallowAnalysis.h"
@@ -24,17 +25,32 @@
 class DocumentHandle;
 class Cursor;
 
+// Navigation accepts the insertion point immediately after an identifier as well.
+const parsing::Token* getNavigationTokenAt(const std::shared_ptr<server::SlangDoc>& doc,
+                                           slang::SourceLocation loc);
+
 struct ClientOwner {
+    ClientOwner() {
+        // Synthetic `**Token:** ...` debug hovers exist for developer ergonomics in `SLANG_DEBUG`
+        // builds, but they cause hover goldens to diverge between Debug and Release. Tests don't
+        // exercise them, so turn them off.
+        server::ServerDriver::s_debugHoversEnabled = false;
+    }
     /// This needs to be made before passing to SlangServer
     ClientHarness client;
 };
 
 class ServerHarness : private ClientOwner, public server::SlangServer {
+    inline static const lsp::ClientCapabilities defaultCapabilities{
+        .experimental = rfl::to_generic(lsp::ExperimentalClientCapabilities{
+            .inactiveRegions = lsp::InactiveRegionsClientCapabilities{.inactiveRegions = true}})};
+
 public:
     using ClientOwner::client;
 
     // Constructor with custom initialization parameters, no workspace folder set
-    explicit ServerHarness(lsp::InitializeParams params = {}) : ClientOwner(), SlangServer(client) {
+    explicit ServerHarness(lsp::InitializeParams params = {.capabilities = defaultCapabilities}) :
+        ClientOwner(), SlangServer(client) {
         getInitialize(params);
         onInitialized(lsp::InitializedParams{});
     }
@@ -43,8 +59,10 @@ public:
     explicit ServerHarness(const std::string& repoRoot) : ClientOwner(), SlangServer(client) {
         auto repoDir = (findSlangRoot() / "tests/data" / repoRoot);
         fs::current_path(repoDir);
-        getInitialize(lsp::InitializeParams{.workspaceFolders = {{lsp::WorkspaceFolder{
-                                                .uri = URI::fromFile(repoDir), .name = "test"}}}});
+        lsp::InitializeParams params{.capabilities = defaultCapabilities,
+                                     .workspaceFolders = {{lsp::WorkspaceFolder{
+                                         .uri = URI::fromFile(repoDir), .name = "test"}}}};
+        getInitialize(params);
         onInitialized(lsp::InitializedParams{});
     }
 
@@ -63,19 +81,24 @@ public:
     // Cone helpers
     void checkPrepareCallHierarchy(const Cursor& cursor, const std::set<std::string>& expected);
 
-    struct ExpectedHierResult {
+    struct ExpectedConeResult {
         std::string name;
         const Cursor* cursor;
 
-        auto operator<=>(const ExpectedHierResult& other) const {
+        auto operator<=>(const ExpectedConeResult& other) const {
             if (auto cmp = name <=> other.name; cmp != 0)
                 return cmp;
             return cursor <=> other.cursor;
         }
-        bool operator==(const ExpectedHierResult& other) const = default;
+        bool operator==(const ExpectedConeResult& other) const = default;
     };
-    void checkIncomingCalls(const std::string& path, const std::set<ExpectedHierResult>& expected);
-    void checkOutgoingCalls(const std::string& path, const std::set<ExpectedHierResult>& expected);
+    void checkConeCommand(const std::string& command, const std::string& path,
+                          const std::set<ExpectedConeResult>& expected);
+
+    std::optional<lsp::LSPAny> executeCommand(const lsp::ExecuteCommandParams& params,
+                                              const lsp::RequestContext& ctx = {}) {
+        return getWorkspaceExecuteCommand(params, ctx);
+    }
 
     std::shared_ptr<server::SlangDoc> getDoc(const URI& uri);
 
@@ -83,7 +106,7 @@ public:
     std::vector<std::string> getModulesInFile(const std::string& fileName);
 
     std::optional<std::vector<lsp::Location>> getDocReferences(
-        const lsp::ReferenceParams& params) override;
+        const lsp::ReferenceParams& params, lsp::RequestContext ctx = {}) override;
 
     // For access to isWcpVariable
     // TODO -- remove once isWcpVariable is removed
@@ -117,6 +140,7 @@ public:
     void insert(lsp::uint offset, std::string text);
     void append(std::string text);
     void erase(size_t start, size_t end);
+    void replaceAll(std::string text);
 
     Cursor before(std::string before, lsp::uint start_pos = 0);
     Cursor after(std::string after, lsp::uint start_pos = 0);
@@ -131,12 +155,29 @@ public:
     void open();
 
     /// @brief Get the line at a given line number
-    /// @param line The line number (0-based / Slang lines)
+    /// @param line The 1-based slang line number. Returns empty for line 0.
     std::string_view getLine(lsp::uint line) {
-        return m_server.sourceManager().getLine(doc->getBuffer(), line);
+        auto text = doc->getText();
+        if (line == 0 || text.empty())
+            return {};
+
+        std::vector<size_t> lineOffsets;
+        SourceManager::computeLineOffsets(text, lineOffsets);
+
+        size_t lineIndex = line - 1;
+        if (lineIndex >= lineOffsets.size())
+            return {};
+
+        size_t start = lineOffsets[lineIndex];
+        size_t end = lineIndex + 1 < lineOffsets.size() ? lineOffsets[lineIndex + 1] : text.size();
+        if (end > start && text[end - 1] == '\0')
+            end--;
+
+        return text.substr(start, end - start);
     }
 
     lsp::Position getPosition(lsp::uint offset);
+    lsp::uint getOffset(const lsp::Position& position) const;
     std::vector<lsp::DocumentSymbol> getSymbolTree();
     std::vector<lsp::Diagnostic> getDiagnostics();
 
@@ -233,7 +274,8 @@ public:
         }
     }
 
-    void insert() { m_cursor.write(m_item.insertText.value_or(m_item.label)); }
+    /// Apply the completion exactly as an LSP client would, preferring its authoritative textEdit.
+    void insert();
 };
 
 template<typename ElementT>
@@ -259,9 +301,9 @@ public:
         for (lsp::uint offset = 0; offset < data.size() - 1; offset++) {
             auto locOpt = hdl.getLocation(offset);
             auto loc = *locOpt;
-            auto line = sm.getLineNumber(loc);
+            auto line = sm.getRawLineNumber(loc);
 
-            bool newLine = line != sm.getLineNumber(prevLoc);
+            bool newLine = line != sm.getRawLineNumber(prevLoc);
 
             // Get current element
             std::optional<std::variant<ElementT, std::string>> currentElement;
@@ -303,6 +345,15 @@ public:
             prevLoc = loc;
             prevElement = currentElement;
         }
+
+        // Identifier-end navigation can extend through the final newline. Flush the last
+        // element even when no subsequent character causes a transition.
+        if (prevElement.has_value() && data.size() > 1) {
+            if (std::holds_alternative<std::string>(*prevElement))
+                test.record(std::get<std::string>(*prevElement) + "\n");
+            else
+                processElementTransition(&hdl, sm, static_cast<lsp::uint>(data.size() - 2));
+        }
     }
 
 protected:
@@ -336,28 +387,59 @@ protected:
 
 class SymbolRefScanner : public DocumentScanner<server::DefinitionInfo> {
 public:
-    SymbolRefScanner() : DocumentScanner<server::DefinitionInfo>() {}
+    explicit SymbolRefScanner(std::vector<lsp::uint> selectedOffsets = {}) :
+        DocumentScanner<server::DefinitionInfo>(), selectedOffsets(std::move(selectedOffsets)) {}
 
 protected:
+    std::vector<lsp::uint> selectedOffsets;
+
     std::optional<server::DefinitionInfo> getElementAt(DocumentHandle* hdl,
                                                        lsp::uint offset) override {
-        return hdl->getDefinitionInfoAt(offset);
+        auto info = hdl->getDefinitionInfoAt(offset);
+        if (!info || selectedOffsets.empty())
+            return info;
+
+        auto doc = hdl->doc;
+        auto token = getNavigationTokenAt(doc, slang::SourceLocation(doc->getBuffer(), offset));
+        if (!token)
+            return {};
+
+        for (auto selectedOffset : selectedOffsets) {
+            auto selectedToken = doc->getWordTokenAt(
+                slang::SourceLocation(doc->getBuffer(), selectedOffset));
+            if (selectedToken && selectedToken->location() == token->location())
+                return info;
+        }
+        return {};
     }
 
     void processElementTransition(DocumentHandle* hdl, SourceManager&, lsp::uint offset) override {
         // Get the current syntax node at the symbol's location
         auto doc = hdl->doc;
-        auto tok = doc->getWordTokenAt(slang::SourceLocation(doc->getBuffer(), offset));
+        auto tok = getNavigationTokenAt(doc, slang::SourceLocation(doc->getBuffer(), offset));
 
         auto pElem = std::get<server::DefinitionInfo>(*prevElement);
-        if (tok && pElem.nameToken.location() == tok->location()) {
-            auto kindStr = pElem.symbol ? toString(pElem.symbol->kind) : toString(pElem.node->kind);
-            test.record(fmt::format(" Sym {} : {}\n", pElem.nameToken.valueText(), kindStr));
+        auto& nameToken = pElem.nameToken();
+        bool multilineHover =
+            !selectedOffsets.empty() &&
+            (pElem.targets.size() > 1 || std::ranges::any_of(pElem.targets, [](const auto& target) {
+                 if (std::holds_alternative<server::DefinitionInfo::PortConnectionTarget>(target))
+                     return true;
+                 if (auto* symbol = std::get_if<server::DefinitionInfo::SymbolTarget>(&target))
+                     return symbol->syntaxes.size() > 1;
+                 return false;
+             }));
+        if (tok && nameToken.location() == tok->location() && !multilineHover) {
+            auto symbol = pElem.symbol();
+            auto kindStr = symbol ? toString(symbol->kind)
+                           : pElem.macro() && pElem.macro()->syntaxTarget()
+                               ? toString(pElem.macro()->syntaxTarget()->node->kind)
+                           : pElem.macro() ? "CommandLineDefine"
+                                           : "SystemName";
+            test.record(fmt::format(" Sym {} : {}\n", nameToken.valueText(), kindStr));
         }
         else {
-            test.record(fmt::format(" Ref -> "));
-            // Print hover, but turn newlines into \n
-            // auto maybeHover = doc->getAnalysis().getDocHover(hdl->getPosition(offset), true);
+            test.record(multilineHover ? " Ref ->\n" : " Ref -> ");
             auto maybeHover = hdl->getHoverAt(offset);
             if (!maybeHover) {
                 test.record(" No Hover\n");
@@ -375,6 +457,24 @@ protected:
             };
             replace(hoverText, "````systemverilog\n", "`");
             replace(hoverText, "\n````", "`");
+            replace(hoverText, URI::fromFile(findSlangRoot()).str(), "file://");
+            if (multilineHover) {
+                size_t start = 0;
+                while (start <= hoverText.size()) {
+                    auto end = hoverText.find('\n', start);
+                    if (end == std::string::npos)
+                        end = hoverText.size();
+                    auto line = std::string_view(hoverText).substr(start, end - start);
+                    while (line.ends_with(' '))
+                        line.remove_suffix(1);
+                    if (!line.empty())
+                        test.record(fmt::format("    | {}\n", line));
+                    if (end == hoverText.size())
+                        break;
+                    start = end + 1;
+                }
+                return;
+            }
             std::string singleLine;
             for (char c : hoverText) {
                 if (c == '\n' || c == '\r') {
@@ -426,7 +526,7 @@ protected:
 
         // Get the token at this location for context
         auto doc = hdl->doc;
-        auto tok = doc->getWordTokenAt(slang::SourceLocation(doc->getBuffer(), offset));
+        auto tok = getNavigationTokenAt(doc, slang::SourceLocation(doc->getBuffer(), offset));
         std::string tokenText = tok ? std::string(tok->valueText()) : "";
 
         // This sanity check is tempting, but will break down on things like enum arrays

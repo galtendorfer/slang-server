@@ -13,7 +13,8 @@
 #include "ast/ServerCompilation.h"
 #include "codeactions/CodeActionDispatch.h"
 #include "completions/CompletionDispatch.h"
-#include "document/ShallowAnalysis.h"
+#include "document/DefinitionInfo.h"
+#include "lsp/RequestContext.h"
 #include "lsp/URI.h"
 #include <filesystem>
 #include <memory>
@@ -27,11 +28,6 @@
 #include "slang/util/FlatMap.h"
 namespace server {
 using namespace slang;
-enum FileUpdateType {
-    OPEN,
-    CHANGE,
-    SAVE,
-};
 
 /// @brief Manages the document handles, which include open and referenced symbols/documents.
 /// Syntax trees and options are used to build one, after flags are processed via a slang driver.
@@ -39,10 +35,16 @@ enum FileUpdateType {
 /// options passed in a filelist
 class ServerDriver {
 public:
-    static std::unique_ptr<ServerDriver> create(Indexer& indexer, SlangLspClient& client,
-                                                const Config& config,
-                                                std::vector<std::string> buildfiles = {},
-                                                const ServerDriver* oldDriver = nullptr);
+    static std::unique_ptr<ServerDriver> createForExplore(
+        Indexer& indexer, SlangLspClient& client, const Config& config,
+        std::optional<std::string_view> workspaceFolder = std::nullopt,
+        const ServerDriver* oldDriver = nullptr);
+
+    static std::unique_ptr<ServerDriver> createFromFileLists(
+        Indexer& indexer, SlangLspClient& client, const Config& config,
+        std::vector<std::string> buildfiles,
+        std::optional<std::string_view> workspaceFolder = std::nullopt,
+        const ServerDriver* oldDriver = nullptr);
     /// Mapping of URI to SlangDoc, which may hold a shallow analysis of the document
     std::unordered_map<URI, std::shared_ptr<SlangDoc>> docs;
 
@@ -79,7 +81,11 @@ public:
     /// @brief Reload a document from disk, used when external tools modify open files
     void reloadDocument(const URI& uri);
 
-    void onDocDidChange(const lsp::DidChangeTextDocumentParams& params);
+    void onDocDidChange(const lsp::DidChangeTextDocumentParams& params,
+                        const lsp::RequestContext& ctx = {});
+
+    /// @brief Update the index and refresh relevant diagnostics after a document is saved
+    void onDocDidSave(SlangDoc& doc);
 
     /// @brief Checks if a document is open
     bool isDocumentOpen(const URI& uri);
@@ -88,11 +94,15 @@ public:
     /// Reloads all changed buffers first, then updates open documents
     void onWorkspaceDidChangeWatchedFiles(const lsp::DidChangeWatchedFilesParams& params);
 
-    void updateDoc(SlangDoc& doc, FileUpdateType type);
-
     std::shared_ptr<SlangDoc> getDocument(const URI& uri);
 
-    std::vector<std::shared_ptr<SlangDoc>> getDependentDocs(std::shared_ptr<SyntaxTree> tree);
+    /// Record the active instance for the module reached by `instPath`, then invalidate
+    /// every open document's cached analysis so subsequent hovers/gotos see the new
+    /// selection. Refreshes client-side code lenses and inlay hints.
+    bool setActiveInstance(std::string_view hierPath);
+
+    std::vector<std::shared_ptr<syntax::SyntaxTree>> getDependentTrees(
+        std::shared_ptr<syntax::SyntaxTree> tree);
 
     std::vector<std::string> getModulesInFile(const std::string& path);
 
@@ -104,11 +114,9 @@ public:
     std::optional<DefinitionInfo> getDefinitionInfoAt(const URI& uri,
                                                       const lsp::Position& position);
 
-    /// @brief Gets LSP definition links for a position in a document
-    /// @param uri The URI of the document
-    /// @param position The LSP position to query
-    /// @return Vector of location links to definitions
-    std::vector<lsp::LocationLink> getDocDefinition(const URI& uri, const lsp::Position& position);
+    /// Return the concrete full-design instance referenced by an instantiation token.
+    std::optional<std::string> getDesignInstancePathAt(const URI& uri,
+                                                       const lsp::Position& position);
 
     /// @brief Gets hover information for a symbol at an LSP position
     /// @param uri The URI of the document
@@ -130,7 +138,8 @@ public:
     /// @return Optional vector of locations, or nullopt if no symbol found
     std::optional<std::vector<lsp::Location>> getDocReferences(const URI& uri,
                                                                const lsp::Position& position,
-                                                               bool includeDeclaration);
+                                                               bool includeDeclaration,
+                                                               const lsp::RequestContext& ctx = {});
 
     /// @brief Renames a symbol in a document
     /// @param uri The URI of the document
@@ -140,14 +149,9 @@ public:
     std::optional<lsp::WorkspaceEdit> getDocRename(const URI& uri, const lsp::Position& position,
                                                    std::string_view newName);
 
-    /// @brief Creates a compilation from the given URI and top module name.
-    /// @return True if the compilation was created successfully
-    bool createCompilation(std::shared_ptr<SlangDoc> doc, std::string_view top);
-
-    /// @brief Creates a compilation from the given syntax trees, typically when the .f already
-    /// specifies the top level(s). Does not use the index.
-    /// @return True if the compilation was created successfully
-    bool createCompilation();
+    static std::unique_ptr<ServerDriver> createFromTop(
+        Indexer& indexer, SlangLspClient& client, const Config& config, const URI& topUri,
+        std::optional<std::string_view> workspaceFolder, const ServerDriver* oldDriver);
 
     /// @brief Constructs a new ServerDriver instance by creating and configuring a driver
     /// internally
@@ -156,10 +160,20 @@ public:
     /// @param config Reference to the configuration object
     /// @param buildfiles List of build files to process
     ServerDriver(Indexer& indexer, SlangLspClient& client, const Config& config,
-                 std::vector<std::string> buildfiles);
+                 std::vector<std::string> buildfiles,
+                 std::optional<std::string_view> workspaceFolder);
+
+    size_t getWsRelativePathOffset(std::string_view path) const {
+        return path.starts_with(m_workspacePathPrefix) ? m_workspacePathPrefix.size() : 0;
+    }
 
     /// Map from macro name to the config/build file that defined it
     flat_hash_map<std::string, std::filesystem::path> m_defineSources;
+
+    /// When true (default in `SLANG_DEBUG` builds), `getDocHover` returns a synthetic
+    /// `**Token:** ...` hover for tokens with no resolved definition. Tests turn this off so
+    /// goldens don't diverge between Debug and Release builds.
+    static bool s_debugHoversEnabled;
 
 private:
     /// Reference to the indexer for module/macro indexing
@@ -168,17 +182,37 @@ private:
     /// Reference to the config object
     const Config& m_config;
 
+    std::string m_workspacePathPrefix;
+
     /// Parse config flags and build files, load sources, create documents
     void parseAndLoadSources(const std::vector<std::string>& buildfiles);
+
+    /// Drop analysis state derived from the active design and refresh client-side annotations.
+    void invalidateAnalysesAndRefreshClient();
+
+    std::optional<DefinitionInfo> getMacroDefinitionInfo(const ShallowAnalysis& analysis,
+                                                         const parsing::Token& token,
+                                                         const syntax::SyntaxNode& referenceSyntax);
 
     /// Set of URIs for documents that are explicitly opened by the client
     flat_hash_set<URI> m_openDocs;
 
+    /// Every source file covered by the build, including secondary single-unit buffers.
+    flat_hash_set<URI> m_buildSourceUris;
+
+    void copyOpenDocumentsFrom(const ServerDriver* oldDriver);
+
+    /// @brief Run shallow analysis and publish diagnostics and inactive regions for one document
+    void analyzeDocument(SlangDoc& doc, const lsp::RequestContext& ctx = {});
+
+    /// @brief Publish diagnostics for the active full compilation, optionally prioritizing a URI
+    void publishCompilationDiagnostics(const URI* priorityUri = nullptr);
+
     /// Helper to add member references to the references vector
     void addMemberReferences(std::vector<lsp::Location>& references,
                              const ast::Symbol& parentSymbol, const ast::Symbol& targetSymbol,
-                             bool isTypeMember = false);
+                             bool isTypeMember = false, const lsp::RequestContext& ctx = {});
 
-    void publishInactiveRegions(SlangDoc& doc);
+    void publishInactiveRegions(SlangDoc& doc, const lsp::RequestContext& ctx = {});
 };
 } // namespace server

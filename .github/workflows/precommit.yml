@@ -6,6 +6,10 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   pre-commit-checks:
     runs-on: ubuntu-latest
@@ -26,4 +30,4 @@ jobs:
         run: uv sync --locked --all-extras --dev
 
       - name: Run pre-commit hooks
-        run: uv run pre-commit run --all-files
+        run: uv run prek run --all-files
