@@ -720,7 +720,7 @@ void SlangServer::loadConfig(const Config& config, bool forceIndexing) {
     m_config = Config(config);
 
     if (m_config.build.value().has_value()) {
-        m_client.showInfo("Using build file: " + *m_config.build.value());
+        INFO("Using build file: {}", *m_config.build.value());
         setBuildFile(*m_config.build.value());
     }
     else {

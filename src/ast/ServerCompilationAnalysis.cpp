@@ -30,8 +30,12 @@ ServerCompilationAnalysis::ServerCompilationAnalysis(
         compilation.addSyntaxTree(tree);
 
         for (auto bufferId : tree->getSourceBufferIds()) {
-            if (seenBuffers.insert(bufferId).second)
+            if (seenBuffers.insert(bufferId).second) {
                 bufferIds.push_back(bufferId);
+                auto path = sourceManager.getFullPath(bufferId);
+                if (!path.empty())
+                    sourcePaths.emplace(path.string());
+            }
         }
     }
 

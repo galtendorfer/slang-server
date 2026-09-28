@@ -151,6 +151,68 @@ const ast::Symbol* ShallowAnalysis::getDesignSymbol(const ast::Symbol& shallowSy
     return m_activeDesign ? m_activeDesign->getDesignSymbol(shallowSymbol) : nullptr;
 }
 
+const ast::Symbol* ShallowAnalysis::getActiveInstantiationDefinitionAtToken(
+    const parsing::Token* token) const {
+    if (!m_activeDesign || !token)
+        return nullptr;
+
+    auto* syntax = syntaxes.getTokenParent(token);
+    auto* instantiation = syntax ? syntax->as_if<syntax::HierarchyInstantiationSyntax>() : nullptr;
+    if (!instantiation || &instantiation->type != token)
+        return nullptr;
+
+    // An unrelated open file can declare its own same-name modules. Only use the build
+    // to resolve files it actually contains, accepting a newer edited buffer of that file.
+    auto& designAnalysis = m_activeDesign->getAnalysis();
+    auto& compilation = designAnalysis.compilation;
+    const auto& sourcePath = m_sourceManager.getFullPath(m_buffer);
+    if (sourcePath.empty() || !designAnalysis.sourcePaths.contains(sourcePath.string()))
+        return nullptr;
+
+    // The design refreshes on save. A definition in an edited file can already have lost
+    // its source metadata; let shallow analysis provide current locations in that case.
+    auto isCurrent = [&](const ast::Symbol* definition) {
+        if (!definition)
+            return false;
+        auto original = m_sourceManager.getFullyOriginalLoc(definition->location);
+        auto expanded = m_sourceManager.getFullyExpandedLoc(definition->location);
+        return m_sourceManager.isLatestData(original.buffer()) &&
+               m_sourceManager.isLatestData(expanded.buffer());
+    };
+
+    // Preserve scoped definitions and the selected design instance when shallow elaboration
+    // can identify the child. Its definition may differ from a global same-name module.
+    for (auto* instanceSyntax : instantiation->instances) {
+        auto* shallowInstance = m_symbolIndexer.getSymbol(instanceSyntax);
+        auto* designSymbol = shallowInstance ? getDesignSymbol(*shallowInstance) : nullptr;
+        while (auto* array = designSymbol ? designSymbol->as_if<ast::InstanceArraySymbol>()
+                                          : nullptr) {
+            designSymbol = array->elements.empty() ? nullptr : array->elements.front();
+        }
+        if (auto* instance = designSymbol ? designSymbol->as_if<ast::InstanceSymbol>() : nullptr) {
+            if (instance->getDefinition().name == token->valueText())
+                return isCurrent(&instance->getDefinition()) ? &instance->getDefinition() : nullptr;
+        }
+    }
+
+    // A lexical definition can remain valid in an inactive branch without a mapped design
+    // instance. Do not replace it with an unrelated global module from the build.
+    for (auto* symbol : getSymbolsAtToken(token)) {
+        if (auto* definition = symbol->as_if<ast::DefinitionSymbol>()) {
+            auto* parent = definition->getParentScope();
+            if (parent && parent->asSymbol().kind != ast::SymbolKind::CompilationUnit &&
+                parent->asSymbol().kind != ast::SymbolKind::Root)
+                return nullptr;
+        }
+    }
+
+    // A dependency can be absent from the shallow index while still present in the build.
+    // The shared design context keeps the definition alive across analysis refreshes.
+    auto* definition =
+        compilation.tryGetDefinition(token->valueText(), compilation.getRoot()).definition;
+    return isCurrent(definition) ? definition : nullptr;
+}
+
 std::optional<std::string> ShallowAnalysis::getDesignInstancePathAtToken(
     const parsing::Token* token) const {
     if (!m_activeDesign || !token)
