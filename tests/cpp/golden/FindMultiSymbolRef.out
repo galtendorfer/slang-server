@@ -8,10 +8,10 @@ endpackage
 package forwarded;
 
     import features::ITEM;
-                     ^^^^ Ref -> **Parameter** `ITEM` in `features`  \n\Type: `int`  \n\Value: `4`  \n\\n\\n\---\n\\n\`localparam int ITEM = 4`
+                     ^^^^^ Ref -> **Parameter** `ITEM` in `features`  \n\Type: `int`  \n\Value: `4`  \n\\n\\n\---\n\\n\`localparam int ITEM = 4`
 
     export features::ITEM;
-                     ^^^^ Ref -> **Parameter** `ITEM` in `features`  \n\Type: `int`  \n\Value: `4`  \n\\n\\n\---\n\\n\`localparam int ITEM = 4`
+                     ^^^^^ Ref -> **Parameter** `ITEM` in `features`  \n\Type: `int`  \n\Value: `4`  \n\\n\\n\---\n\\n\`localparam int ITEM = 4`
 
 endpackage
 
@@ -24,7 +24,7 @@ interface bus;
     endtask
 
     modport endpoint(output data, import task run(input logic value));
-                            ^^^^ Ref ->
+                            ^^^^^ Ref ->
     | **Output ModportPort** `data` in `bus.endpoint`
     | Type: `logic[3:0]`
     | Width: `4`
@@ -32,7 +32,7 @@ interface bus;
     | `output data`
     | ---
     | `logic [3:0] data;`
-                                              ^^^ Ref ->
+                                              ^^^^ Ref ->
     | **MethodPrototype** `run` in `bus.endpoint`
     | ---
     | `task run(input logic value)`
@@ -51,7 +51,7 @@ endmodule
 module top;
 
     import duplicate_pkg::*;
-           ^^^^^^^^^^^^^ Ref ->
+           ^^^^^^^^^^^^^^ Ref ->
     | **Package** `duplicate_pkg`
     | ---
     | `package automatic duplicate_pkg;`
@@ -63,7 +63,7 @@ module top;
     logic [3:0] shared;
 
     leaf u(.shared);
-            ^^^^^^ Ref ->
+            ^^^^^^^ Ref ->
     | **Outer** **Variable** `shared` in `top`
     | Type: `logic[3:0]`
     | Width: `4`
@@ -80,7 +80,7 @@ module top;
     bus b();
 
     duplicate d();
-    ^^^^^^^^^ Ref ->
+    ^^^^^^^^^^ Ref ->
     | **Module** `duplicate`
     | ---
     | `module duplicate #(parameter int FIRST_MODULE = 1);`
@@ -90,7 +90,7 @@ module top;
     | `module duplicate #(parameter int SECOND_MODULE = 2);`
 
     for (genvar i = 0; i < 2; i++) begin : g
-                ^ Ref ->
+                ^^ Ref ->
     | **Genvar** `i` in `top.g`
     | Type: `integer`
     | Value range: `0` through `1`
@@ -98,13 +98,13 @@ module top;
     | `i`
 
         localparam int VALUE = i;
-                       ^^^^^ Ref ->
+                       ^^^^^^ Ref ->
     | **Parameter** `VALUE` in `top.g`
     | Type: `int`
     | Value range: `0` through `1`
     | ---
     | `localparam int VALUE = i`
-                               ^ Ref ->
+                               ^^ Ref ->
     | **Genvar** `i` in `top.g`
     | Type: `integer`
     | Value range: `0` through `1`
@@ -116,7 +116,7 @@ module top;
 endmodule
 
 `ifdef MULTI_MACRO
-       ^^^^^^^^^^^ Ref ->
+       ^^^^^^^^^^^^ Ref ->
     | DefineDirective MULTI_MACRO
     | From `macro_first.svh`
     | ---

@@ -50,6 +50,20 @@
 namespace server {
 using namespace slang;
 
+namespace {
+
+const parsing::Token* getNavigationTokenAt(const ShallowAnalysis& analysis, SourceLocation loc,
+                                           const lsp::Position& position) {
+    auto* token = analysis.syntaxes.getWordTokenAt(loc);
+    // LSP cursors can sit immediately after an identifier. Prefer the token actually under
+    // the cursor and only retry the preceding character when there is no word at that point.
+    if (!token && position.character > 0 && loc.offset() > 0)
+        token = analysis.syntaxes.getWordTokenAt(loc - 1);
+    return token;
+}
+
+} // namespace
+
 bool ServerDriver::s_debugHoversEnabled =
 #ifdef SLANG_DEBUG
     true;
@@ -735,7 +749,7 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
     if (!loc) {
         return {};
     }
-    const parsing::Token* declTok = analysis->syntaxes.getWordTokenAt(loc.value());
+    const parsing::Token* declTok = getNavigationTokenAt(*analysis, *loc, position);
     if (!declTok) {
         return {};
     }
@@ -1134,7 +1148,7 @@ std::optional<std::vector<lsp::DocumentHighlight>> ServerDriver::getDocDocumentH
     if (!loc) {
         return std::nullopt;
     }
-    auto declTok = analysis->syntaxes.getWordTokenAt(loc.value());
+    auto declTok = getNavigationTokenAt(*analysis, *loc, position);
     if (!declTok) {
         return std::nullopt;
     }
@@ -1238,7 +1252,7 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
         return std::nullopt;
     }
 
-    const parsing::Token* declTok = analysis->syntaxes.getWordTokenAt(loc.value());
+    const parsing::Token* declTok = getNavigationTokenAt(*analysis, *loc, position);
     if (!declTok) {
         return std::nullopt;
     }

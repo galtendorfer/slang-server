@@ -25,6 +25,10 @@
 class DocumentHandle;
 class Cursor;
 
+// Navigation accepts the insertion point immediately after an identifier as well.
+const parsing::Token* getNavigationTokenAt(const std::shared_ptr<server::SlangDoc>& doc,
+                                           slang::SourceLocation loc);
+
 struct ClientOwner {
     ClientOwner() {
         // Synthetic `**Token:** ...` debug hovers exist for developer ergonomics in `SLANG_DEBUG`
@@ -341,6 +345,15 @@ public:
             prevLoc = loc;
             prevElement = currentElement;
         }
+
+        // Identifier-end navigation can extend through the final newline. Flush the last
+        // element even when no subsequent character causes a transition.
+        if (prevElement.has_value() && data.size() > 1) {
+            if (std::holds_alternative<std::string>(*prevElement))
+                test.record(std::get<std::string>(*prevElement) + "\n");
+            else
+                processElementTransition(&hdl, sm, static_cast<lsp::uint>(data.size() - 2));
+        }
     }
 
 protected:
@@ -387,7 +400,7 @@ protected:
             return info;
 
         auto doc = hdl->doc;
-        auto token = doc->getWordTokenAt(slang::SourceLocation(doc->getBuffer(), offset));
+        auto token = getNavigationTokenAt(doc, slang::SourceLocation(doc->getBuffer(), offset));
         if (!token)
             return {};
 
@@ -403,7 +416,7 @@ protected:
     void processElementTransition(DocumentHandle* hdl, SourceManager&, lsp::uint offset) override {
         // Get the current syntax node at the symbol's location
         auto doc = hdl->doc;
-        auto tok = doc->getWordTokenAt(slang::SourceLocation(doc->getBuffer(), offset));
+        auto tok = getNavigationTokenAt(doc, slang::SourceLocation(doc->getBuffer(), offset));
 
         auto pElem = std::get<server::DefinitionInfo>(*prevElement);
         auto& nameToken = pElem.nameToken();
@@ -513,7 +526,7 @@ protected:
 
         // Get the token at this location for context
         auto doc = hdl->doc;
-        auto tok = doc->getWordTokenAt(slang::SourceLocation(doc->getBuffer(), offset));
+        auto tok = getNavigationTokenAt(doc, slang::SourceLocation(doc->getBuffer(), offset));
         std::string tokenText = tok ? std::string(tok->valueText()) : "";
 
         // This sanity check is tempting, but will break down on things like enum arrays

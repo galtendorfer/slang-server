@@ -163,6 +163,14 @@ std::vector<std::string> ServerHarness::getModulesInFile(const std::string& file
     return SlangServer::getModulesInFile(absolutePath.string());
 }
 
+const parsing::Token* getNavigationTokenAt(const std::shared_ptr<server::SlangDoc>& doc,
+                                           slang::SourceLocation loc) {
+    auto* token = doc->getWordTokenAt(loc);
+    if (!token && loc.offset() > 0)
+        token = doc->getWordTokenAt(loc - 1);
+    return token;
+}
+
 std::optional<std::vector<lsp::Location>> ServerHarness::getDocReferences(
     const lsp::ReferenceParams& params, lsp::RequestContext ctx) {
     auto refs = SlangServer::getDocReferences(params, ctx);
@@ -176,7 +184,7 @@ std::optional<std::vector<lsp::Location>> ServerHarness::getDocReferences(
     auto srcLoc = srcDoc->getLocation(params.position);
     REQUIRE(srcLoc.has_value());
 
-    auto srcTok = srcDoc->getWordTokenAt(*srcLoc);
+    auto srcTok = getNavigationTokenAt(srcDoc, *srcLoc);
     REQUIRE(srcTok);
 
     auto expectedText = std::string(srcTok->valueText());
