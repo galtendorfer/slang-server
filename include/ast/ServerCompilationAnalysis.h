@@ -15,6 +15,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "slang/analysis/AnalysisManager.h"
@@ -35,6 +36,10 @@ public:
         SourceManager& sourceManager);
 
     slang::ast::Compilation compilation;
+
+    /// Stable membership even when SourceManager replaces an edited file's buffer.
+    /// Includes headers and every file in a combined compilation unit.
+    std::unordered_set<std::string> sourcePaths;
 
     /// Index of buffer -> definitions and definition -> instances given a compilation. Used for
     /// navigating a compilation via the sidebar

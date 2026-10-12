@@ -50,6 +50,20 @@
 namespace server {
 using namespace slang;
 
+namespace {
+
+const parsing::Token* getNavigationTokenAt(const ShallowAnalysis& analysis, SourceLocation loc,
+                                           const lsp::Position& position) {
+    auto* token = analysis.syntaxes.getWordTokenAt(loc);
+    // LSP cursors can sit immediately after an identifier. Prefer the token actually under
+    // the cursor and only retry the preceding character when there is no word at that point.
+    if (!token && position.character > 0 && loc.offset() > 0)
+        token = analysis.syntaxes.getWordTokenAt(loc - 1);
+    return token;
+}
+
+} // namespace
+
 bool ServerDriver::s_debugHoversEnabled =
 #ifdef SLANG_DEBUG
     true;
@@ -717,7 +731,7 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
     if (!loc) {
         return {};
     }
-    const parsing::Token* declTok = analysis->syntaxes.getWordTokenAt(loc.value());
+    const parsing::Token* declTok = getNavigationTokenAt(*analysis, *loc, position);
     if (!declTok) {
         return {};
     }
@@ -820,7 +834,12 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
         }
     };
 
+    auto* buildDefinition = analysis->getActiveInstantiationDefinitionAtToken(declTok);
     auto localSymbols = analysis->getSymbolsAtToken(declTok);
+    if (buildDefinition) {
+        localSymbols.clear();
+        localSymbols.push_back(buildDefinition);
+    }
     for (auto* symbol : localSymbols) {
         addSymbol(symbol, analysis);
         if (auto* port = symbol->as_if<ast::InterfacePortSymbol>()) {
@@ -877,8 +896,8 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
 
     // A declaration in the queried document is authoritative. Externally resolved top-level
     // names still use the index to retain other possible definitions.
-    bool searchIndex = localSymbols.empty() ||
-                       (hasTopLevelResolution && !hasLocalTopLevelResolution);
+    bool searchIndex = !buildDefinition && (localSymbols.empty() ||
+                                            (hasTopLevelResolution && !hasLocalTopLevelResolution));
     if (searchIndex) {
         auto matchesResolvedKind = [&](const ast::Symbol* candidate) {
             if (localSymbols.empty())
@@ -980,7 +999,8 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
                     syntaxes.push_back(std::move(*internalSyntax));
             }
         }
-        auto* designSymbol = symbolAnalysis->getDesignSymbol(*symbol);
+        auto* designSymbol = symbol == buildDefinition ? symbol
+                                                       : symbolAnalysis->getDesignSymbol(*symbol);
         return DefinitionInfo::SymbolTarget{.syntaxes = std::move(syntaxes),
                                             .symbol = designSymbol ? designSymbol : symbol,
                                             .analysis = symbolAnalysis,
@@ -1108,7 +1128,7 @@ std::optional<std::vector<lsp::DocumentHighlight>> ServerDriver::getDocDocumentH
     if (!loc) {
         return std::nullopt;
     }
-    auto declTok = analysis->syntaxes.getWordTokenAt(loc.value());
+    auto declTok = getNavigationTokenAt(*analysis, *loc, position);
     if (!declTok) {
         return std::nullopt;
     }
@@ -1212,7 +1232,7 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
         return std::nullopt;
     }
 
-    const parsing::Token* declTok = analysis->syntaxes.getWordTokenAt(loc.value());
+    const parsing::Token* declTok = getNavigationTokenAt(*analysis, *loc, position);
     if (!declTok) {
         return std::nullopt;
     }
@@ -1243,8 +1263,13 @@ std::optional<std::vector<lsp::Location>> ServerDriver::getDocReferences(
             targetSymbols.push_back({symbol, symbolAnalysis, symbolAnalysisBuffer});
     };
 
-    for (auto* symbol : analysis->getSymbolsAtToken(declTok))
-        addTargetSymbol(symbol, analysis, doc->getBuffer());
+    if (auto* definition = analysis->getActiveInstantiationDefinitionAtToken(declTok)) {
+        addTargetSymbol(definition, analysis, doc->getBuffer());
+    }
+    else {
+        for (auto* symbol : analysis->getSymbolsAtToken(declTok))
+            addTargetSymbol(symbol, analysis, doc->getBuffer());
+    }
 
     if (targetSymbols.empty())
         return std::nullopt;

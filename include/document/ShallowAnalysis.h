@@ -125,6 +125,11 @@ public:
     /// @brief Return the corresponding symbol from the selected full-design instance, if any.
     const slang::ast::Symbol* getDesignSymbol(const slang::ast::Symbol& shallowSymbol) const;
 
+    /// Resolve a module type token using the active design instead of indexed duplicates.
+    /// The returned symbol is owned by this analysis's retained design snapshot.
+    const slang::ast::Symbol* getActiveInstantiationDefinitionAtToken(
+        const slang::parsing::Token* token) const;
+
     /// Return the full-design instance referenced by a module, named parameter, or named port
     /// token at an instantiation site.
     std::optional<std::string> getDesignInstancePathAtToken(
