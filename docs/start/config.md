@@ -35,6 +35,8 @@ All configuration options are optional and have sensible defaults. In VSCode, th
 
     Which directories to index; By default it indexes the entire workspace. It's **highly** recommended to configure this for your repo, especially if there are generated build directories and non-hardware directories that can be skipped.
 
+    Several indexed files can declare the same module, interface or package, for example when a dependency is vendored twice. A selected [build](#build) decides which declaration the files it compiles refer to. Without a build, and for files outside of it, the declaration sharing the most directories with the referencing file is used, then the shallowest one. Go to definition lists the remaining declarations after it.
+
 ---
 
 ### `flags`

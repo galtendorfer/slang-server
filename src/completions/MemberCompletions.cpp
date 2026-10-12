@@ -189,12 +189,13 @@ public:
         auto* symbol = context.analysis->getSymbolAtToken(receiverToken);
         if (!symbol) {
             WARN("No symbol found for token {}, checking index.", receiverToken->valueText());
-            auto symbolLoc = getIndexer(dispatch).getFirstSymbolLoc(receiverToken->valueText());
-            if (!symbolLoc) {
+            auto symbolFile = getDriver(dispatch).resolveSymbolFile(receiverToken->valueText(),
+                                                                    doc->getPath());
+            if (!symbolFile) {
                 WARN("No symbol found in index for {}", receiverToken->valueText());
                 return;
             }
-            auto targetDoc = getDriver(dispatch).getDocument(URI::fromFile(*symbolLoc->uri));
+            auto targetDoc = getDriver(dispatch).getDocument(URI::fromFile(symbolFile->path));
             if (!targetDoc)
                 return;
             symbol = targetDoc->getAnalysis()->getDefinition(receiverToken->valueText());

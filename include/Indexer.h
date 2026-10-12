@@ -67,8 +67,15 @@ struct Indexer {
         const std::filesystem::path* uri;
         slang::syntax::SyntaxKind kind;
     };
-    // Get first symbol location for a name (for instance completions, etc.)
-    std::optional<GlobalSymbolLoc> getFirstSymbolLoc(std::string_view name) const;
+    /// Files declaring @a name, best candidate first for a reference made from @a referrer.
+    /// Duplicate declarations usually come from a second copy of a dependency: the copy sharing
+    /// the most directories with the referrer ranks first, then the shallowest one.
+    std::vector<std::filesystem::path> getFilesForSymbol(
+        std::string_view name, const std::filesystem::path& referrer) const;
+
+    /// The best-ranked declaration of @a name for a reference made from @a referrer.
+    std::optional<GlobalSymbolLoc> getBestSymbolLoc(std::string_view name,
+                                                    const std::filesystem::path& referrer) const;
 
     // Get all macro names (for macro completions)
     std::vector<std::string> getAllMacroNames() const;
@@ -119,6 +126,10 @@ private:
 
     // Storage for all indexed files (for efficient removal)
     std::unordered_map<const std::filesystem::path*, IndexedPath> indexedFiles;
+
+    // Declarations of a name ordered for a referrer; the caller holds the read lock
+    slang::SmallVector<GlobalSymbolLoc, 2> rankSymbolLocs(
+        std::string_view name, const std::filesystem::path& referrer) const;
 
     // Extracts symbols and referenced symbols
     static void extractFromRoot(const slang::syntax::CompilationUnitSyntax& root,

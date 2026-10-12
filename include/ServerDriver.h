@@ -103,8 +103,23 @@ public:
     /// selection. Refreshes client-side code lenses and inlay hints.
     bool setActiveInstance(std::string_view hierPath);
 
+    struct SymbolFile {
+        std::filesystem::path path;
+        /// The selected build compiles the referrer and defines the name, so declarations of
+        /// the same name in other files do not apply.
+        bool fromBuild = false;
+    };
+
+    /// Find the file declaring a top-level name for a reference made from @a referrer. The
+    /// selected build decides for the files it compiles; any other reference uses the
+    /// best-ranked indexed declaration. An empty referrer means the referencing file is unknown.
+    std::optional<SymbolFile> resolveSymbolFile(std::string_view name,
+                                                std::string_view referrer) const;
+
+    /// Load the files declaring the names that @a tree, the syntax tree of the file at
+    /// @a path, references.
     std::vector<std::shared_ptr<syntax::SyntaxTree>> getDependentTrees(
-        std::shared_ptr<syntax::SyntaxTree> tree);
+        std::shared_ptr<syntax::SyntaxTree> tree, std::string_view path);
 
     std::vector<std::string> getModulesInFile(const std::string& path);
 

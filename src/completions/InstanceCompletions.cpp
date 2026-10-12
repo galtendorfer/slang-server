@@ -9,6 +9,7 @@
 #include "completions/InstanceCompletions.h"
 
 #include "Indexer.h"
+#include "ServerDriver.h"
 #include "lsp/SnippetString.h"
 #include "util/Converters.h"
 #include "util/Formatting.h"
@@ -84,21 +85,24 @@ public:
     CompletionQueryKind kind() const final { return CompletionQueryKind::InstantiationSuffix; }
 
     void getCompletions(std::vector<lsp::CompletionItem>& results, CompletionDispatch& dispatch,
-                        const std::shared_ptr<SlangDoc>&, const CompletionContext&) const final {
+                        const std::shared_ptr<SlangDoc>& doc,
+                        const CompletionContext&) const final {
         if (!moduleToken) {
             WARN("No module token found before instantiation suffix");
             return;
         }
 
         auto name = moduleToken->valueText();
-        auto symbolLoc = getIndexer(dispatch).getFirstSymbolLoc(name);
+        auto symbolLoc = getIndexer(dispatch).getBestSymbolLoc(name, doc->getPath());
         if (!symbolLoc) {
             ERROR("No module found for {}", name);
             return;
         }
 
+        // Complete from the same file that the document's analysis resolves the module to.
+        auto symbolFile = getDriver(dispatch).resolveSymbolFile(name, doc->getPath());
         auto completion = getCompletion(std::string(name), symbolLoc->kind);
-        resolve(dispatch, completion, *symbolLoc->uri, true);
+        resolve(dispatch, completion, symbolFile ? symbolFile->path : *symbolLoc->uri, true);
         results.push_back(std::move(completion));
     }
 
@@ -277,14 +281,13 @@ void InstanceCompletionQuery::resolve(CompletionDispatch& dispatch, lsp::Complet
                                       bool excludeName) {
     auto name = item.label;
     if (!modulePath) {
-        auto files = getIndexer(dispatch).getFilesForSymbol(name);
-        if (files.empty()) {
+        // The item does not record which document asked for it
+        auto symbolFile = getDriver(dispatch).resolveSymbolFile(name, {});
+        if (!symbolFile) {
             WARN("No files found for module {}", name);
             return;
         }
-        if (files.size() > 1)
-            WARN("Multiple files found for module {}: {}", name, rfl::json::write(files));
-        modulePath = files[0];
+        modulePath = std::move(symbolFile->path);
     }
 
     auto maybeTree = syntax::SyntaxTree::fromFile(modulePath->string(), getSourceManager(dispatch),

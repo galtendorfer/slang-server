@@ -337,14 +337,76 @@ std::vector<fs::path> Indexer::getFilesReferencingSymbol(std::string_view name) 
     return result;
 }
 
-std::optional<Indexer::GlobalSymbolLoc> Indexer::getFirstSymbolLoc(std::string_view name) const {
+slang::SmallVector<Indexer::GlobalSymbolLoc, 2> Indexer::rankSymbolLocs(
+    std::string_view name, const fs::path& referrer) const {
+    slang::SmallVector<GlobalSymbolLoc, 2> result;
+    auto it = symbolToFiles_.find(std::string(name));
+    if (it == symbolToFiles_.end())
+        return result;
+
+    result.append(it->second.begin(), it->second.end());
+    if (result.size() < 2)
+        return result;
+
+    struct Rank {
+        size_t sharedDirs;
+        size_t depth;
+        GlobalSymbolLoc loc;
+    };
+    // Glob-based indexing can store paths relative to the working directory
+    auto normalized = [](const fs::path& path) {
+        std::error_code ec;
+        auto absolute = path.is_relative() ? fs::absolute(path, ec) : path;
+        return (ec ? path : absolute).lexically_normal();
+    };
+    auto referrerDir = referrer.empty() ? fs::path() : normalized(referrer).parent_path();
+    std::vector<Rank> ranks;
+    ranks.reserve(result.size());
+    for (const auto& loc : result) {
+        auto path = normalized(*loc.uri);
+        auto dir = path.parent_path();
+        size_t sharedDirs = 0;
+        for (auto a = dir.begin(), b = referrerDir.begin();
+             a != dir.end() && b != referrerDir.end() && *a == *b; ++a, ++b) {
+            sharedDirs++;
+        }
+        ranks.push_back(
+            {sharedDirs, static_cast<size_t>(std::distance(path.begin(), path.end())), loc});
+    }
+
+    // The path is the final key so that the order does not depend on indexing order.
+    std::ranges::sort(ranks, [](const Rank& a, const Rank& b) {
+        if (a.sharedDirs != b.sharedDirs)
+            return a.sharedDirs > b.sharedDirs;
+        if (a.depth != b.depth)
+            return a.depth < b.depth;
+        return *a.loc.uri < *b.loc.uri;
+    });
+
+    result.clear();
+    for (const auto& rank : ranks)
+        result.push_back(rank.loc);
+    return result;
+}
+
+std::vector<fs::path> Indexer::getFilesForSymbol(std::string_view name,
+                                                 const fs::path& referrer) const {
     IndexReadGuard guard(*this);
 
-    auto it = symbolToFiles_.find(std::string(name));
-    if (it == symbolToFiles_.end() || it->second.empty()) {
+    std::vector<fs::path> result;
+    for (const auto& loc : rankSymbolLocs(name, referrer))
+        result.push_back(*loc.uri);
+    return result;
+}
+
+std::optional<Indexer::GlobalSymbolLoc> Indexer::getBestSymbolLoc(std::string_view name,
+                                                                  const fs::path& referrer) const {
+    IndexReadGuard guard(*this);
+
+    auto locs = rankSymbolLocs(name, referrer);
+    if (locs.empty())
         return std::nullopt;
-    }
-    return it->second[0];
+    return locs.front();
 }
 
 std::vector<std::string> Indexer::getAllMacroNames() const {

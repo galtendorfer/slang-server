@@ -604,7 +604,9 @@ std::optional<std::string> ServerCompilation::getPreferredSymbolPath(std::string
     auto& compilation = m_analysis->compilation;
     auto& root = compilation.getRoot();
 
+    bool declared = false;
     if (auto def = compilation.tryGetDefinition(name, root); def.definition) {
+        declared = true;
         auto loc = m_sourceManager.getFullyOriginalLoc(def.definition->location);
         auto fullPath = m_sourceManager.getFullPath(loc.buffer());
         if (!fullPath.empty()) {
@@ -613,6 +615,7 @@ std::optional<std::string> ServerCompilation::getPreferredSymbolPath(std::string
     }
 
     if (auto pkg = compilation.getPackage(name)) {
+        declared = true;
         auto syntax = pkg->getSyntax();
         if (syntax) {
             auto fullPath = m_sourceManager.getFullPath(
@@ -621,6 +624,13 @@ std::optional<std::string> ServerCompilation::getPreferredSymbolPath(std::string
                 return fullPath.string();
             }
         }
+    }
+
+    // An edited file leaves the compilation pointing at its previous buffer, which no longer
+    // has a path, until the next refresh. The document that declares the name still applies.
+    if (declared) {
+        if (auto it = m_moduleToDoc.find(std::string(name)); it != m_moduleToDoc.end())
+            return std::string(it->second->getPath());
     }
 
     return std::nullopt;

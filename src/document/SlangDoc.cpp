@@ -110,7 +110,7 @@ std::shared_ptr<syntax::SyntaxTree> SlangDoc::getSyntaxTree() {
 std::shared_ptr<ShallowAnalysis> SlangDoc::refreshAnalysis(const lsp::RequestContext& ctx) {
     ctx.throwIfCancelled("before analysis");
     auto tree = getSyntaxTree();
-    auto trees = m_driver.getDependentTrees(tree);
+    auto trees = m_driver.getDependentTrees(tree, getPath());
     trees.insert(trees.begin(), tree);
     auto analysis = std::make_shared<ShallowAnalysis>(m_sourceManager, m_buffer.id, tree, m_options,
                                                       trees, m_driver.comp.get());

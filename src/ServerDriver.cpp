@@ -481,18 +481,36 @@ bool ServerDriver::setActiveInstance(std::string_view hierPath) {
     return true;
 }
 
+std::optional<ServerDriver::SymbolFile> ServerDriver::resolveSymbolFile(
+    std::string_view name, std::string_view referrer) const {
+    auto buildPath = comp ? comp->getPreferredSymbolPath(name) : std::nullopt;
+    if (buildPath && (referrer.empty() || m_buildSourceUris.contains(URI::fromFile(referrer))))
+        return SymbolFile{.path = std::move(*buildPath), .fromBuild = true};
+
+    if (auto symbolLoc = m_indexer.getBestSymbolLoc(name, referrer))
+        return SymbolFile{.path = *symbolLoc->uri};
+
+    // A build can compile files that the index does not cover.
+    if (buildPath)
+        return SymbolFile{.path = std::move(*buildPath)};
+    return std::nullopt;
+}
+
 std::vector<std::shared_ptr<syntax::SyntaxTree>> ServerDriver::getDependentTrees(
-    std::shared_ptr<syntax::SyntaxTree> tree) {
+    std::shared_ptr<syntax::SyntaxTree> tree, std::string_view path) {
     std::vector<std::shared_ptr<syntax::SyntaxTree>> result;
-    std::queue<std::shared_ptr<syntax::SyntaxTree>> treesToProcess;
+    // Each tree comes with its file, which decides how the names it references resolve.
+    std::queue<std::pair<std::shared_ptr<syntax::SyntaxTree>, std::string>> treesToProcess;
     flat_hash_set<std::string_view> knownNames;
     flat_hash_set<std::string> processedFiles;
 
-    treesToProcess.push(tree);
+    treesToProcess.emplace(tree, path);
 
     while (!treesToProcess.empty()) {
-        auto currentTree = treesToProcess.front();
+        auto current = std::move(treesToProcess.front());
         treesToProcess.pop();
+        auto& currentTree = current.first;
+        auto& currentPath = current.second;
 
         auto& meta = currentTree->getMetadata();
 
@@ -505,11 +523,11 @@ std::vector<std::shared_ptr<syntax::SyntaxTree>> ServerDriver::getDependentTrees
 
             // Don't try multiple times
             knownNames.emplace(name);
-            auto symbolLoc = m_indexer.getFirstSymbolLoc(name);
-            if (!symbolLoc)
+            auto symbolFile = resolveSymbolFile(name, currentPath);
+            if (!symbolFile)
                 return;
 
-            std::string filePath = symbolLoc->uri->string();
+            std::string filePath = symbolFile->path.string();
 
             // Check if we've already processed this file to avoid cycles
             if (processedFiles.find(filePath) != processedFiles.end())
@@ -527,7 +545,7 @@ std::vector<std::shared_ptr<syntax::SyntaxTree>> ServerDriver::getDependentTrees
                 for (auto& [decl, _] : dependencyTree->getMetadata().nodeMeta) {
                     if (decl->kind == syntax::SyntaxKind::PackageDeclaration ||
                         decl->kind == syntax::SyntaxKind::InterfaceDeclaration) {
-                        treesToProcess.push(dependencyTree);
+                        treesToProcess.emplace(dependencyTree, filePath);
                         break;
                     }
                 }
@@ -599,15 +617,15 @@ std::unique_ptr<ServerDriver> ServerDriver::createFromTop(
     auto* serverDriver = newDriver.get();
     driver::SourceLoader::loadTrees(
         syntaxTrees,
-        [serverDriver](std::string_view name) {
-            auto paths = serverDriver->m_indexer.getFilesForSymbol(name);
-            if (!paths.empty()) {
-                auto maybeBuf = serverDriver->sm.readSource(paths[0], /* library */ nullptr);
+        [serverDriver, &topUri](std::string_view name) {
+            auto symbolLoc = serverDriver->m_indexer.getBestSymbolLoc(name, topUri.getPath());
+            if (symbolLoc) {
+                auto maybeBuf = serverDriver->sm.readSource(*symbolLoc->uri, /* library */ nullptr);
                 if (maybeBuf) {
                     return *maybeBuf;
                 }
                 else {
-                    ERROR("Failed to read source for {}: {}", paths[0].string(),
+                    ERROR("Failed to read source for {}: {}", symbolLoc->uri->string(),
                           maybeBuf.error().message());
                 }
             }
@@ -876,7 +894,7 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
         });
 
     // A declaration in the queried document is authoritative. Externally resolved top-level
-    // names still use the index to retain other possible definitions.
+    // names still look at the files declaring them to retain other possible definitions.
     bool searchIndex = localSymbols.empty() ||
                        (hasTopLevelResolution && !hasLocalTopLevelResolution);
     if (searchIndex) {
@@ -895,10 +913,18 @@ std::optional<DefinitionInfo> ServerDriver::getDefinitionInfoAt(const URI& uri,
             });
         };
 
+        // Best candidate first. The selected build settles which file declares a name for the
+        // files it compiles; anywhere else the other indexed declarations remain alternatives.
+        std::vector<std::filesystem::path> paths;
+        auto symbolFile = resolveSymbolFile(declTok->valueText(), doc->getPath());
+        if (symbolFile)
+            paths.push_back(symbolFile->path);
+        if (!symbolFile || !symbolFile->fromBuild) {
+            auto indexed = m_indexer.getFilesForSymbol(declTok->valueText(), doc->getPath());
+            paths.insert(paths.end(), indexed.begin(), indexed.end());
+        }
+
         std::vector<std::filesystem::path> visited;
-        auto paths = m_indexer.getFilesForSymbol(declTok->valueText());
-        if (paths.size() > 1)
-            std::ranges::sort(paths);
         for (const auto& path : paths) {
             if (std::ranges::find(visited, path) != visited.end())
                 continue;
