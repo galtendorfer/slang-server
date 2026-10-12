@@ -176,10 +176,12 @@ File input is sent to stdin, and formatted output is read from stdout.',
 
   client: LanguageClient | undefined
   private isRestarting: boolean = false
+  private readonly serverOutputChannel: vscode.OutputChannel
 
   path: PathConfigObject = new PathConfigObject(
     {
-      description: 'Path to slang-server (not slang)',
+      description:
+        'Path to slang-server (not slang). Run "slang: Restart Language Server" to apply changes.',
     },
     {
       windows: 'slang-server.exe',
@@ -202,12 +204,13 @@ File input is sent to stdin, and formatted output is read from stdout.',
   args: ConfigObject<string[]> = new ConfigObject({
     default: [],
     description:
-      'Arguments to pass to the slang-server. These are different from slang flags; for those open `.slang/server.json`',
+      'Arguments to pass to the slang-server. These are different from slang flags; for those open `.slang/server.json`. Run "slang: Restart Language Server" to apply changes.',
   })
 
   debugArgs: ConfigObject<string[]> = new ConfigObject({
     default: [],
-    description: 'Arguments to pass to slang-server when debugging',
+    description:
+      'Arguments to pass to slang-server when debugging. Run "slang: Restart Language Server" to apply changes.',
   })
 
   /// The final config from slang-server json files
@@ -228,9 +231,11 @@ File input is sent to stdin, and formatted output is read from stdout.',
 
     const clientOptions: LanguageClientOptions = {
       documentSelector: anyVerilogSelector,
+      outputChannel: this.serverOutputChannel,
     }
 
     this.client = new LanguageClient('slang-server', serverOptions, clientOptions)
+    this.client.info(`Starting language server: ${slangServerPath}`)
     const clientInfo = {
       name: this.context.extension.packageJSON.name as string,
       version: this.context.extension.packageJSON.version as string,
@@ -289,19 +294,11 @@ File input is sent to stdin, and formatted output is read from stdout.',
     const serverInfo = this.client.initializeResult?.serverInfo
     const serverFullVersion = serverInfo?.version?.trim()
 
-    const showManagedInstallInfo = async () => {
-      await vscode.window.showInformationMessage(
-        'Managed slang-server installations can be installed now if `slang.path` is not set.'
-      )
-    }
-
     if (!serverInfo || !serverFullVersion) {
       this.logger.warn('Using old version of slang server without version info.')
-      await vscode.window.showWarningMessage(
-        'You are using an old version of slang-server without version information. ' +
-          'Please update your slang-server installation to ensure all features work correctly.'
+      await this.offerServerUpdate(
+        'You are using an old version of slang-server without version information.'
       )
-      await showManagedInstallInfo()
       return
     }
 
@@ -323,11 +320,10 @@ File input is sent to stdin, and formatted output is read from stdout.',
         const serverMajorMinor = `${parsedServer.major}.${parsedServer.minor}.0`
 
         if (semver.lt(serverMajorMinor, minRequiredVersion)) {
-          vscode.window.showWarningMessage(
-            `Slang server v${serverVersion} is older than minimum required v${minRequiredVersion}. ` +
-              `Please update your server installation.`
+          await this.offerServerUpdate(
+            `Slang server v${serverVersion} is older than minimum required v${minRequiredVersion} for design-aware features.`
           )
-          await showManagedInstallInfo()
+          return
         }
       }
     }
@@ -338,6 +334,40 @@ File input is sent to stdin, and formatted output is read from stdout.',
     }
   }
 
+  private async offerServerUpdate(message: string): Promise<void> {
+    if (this.path.hasConfiguredPath()) {
+      const openSetting = 'Open slang.path Setting'
+      const promptMessage =
+        `${message} Please update your server installation, or clear \`slang.path\` ` +
+        'to switch to a managed install.'
+      this.logger.warn(
+        `${promptMessage} Select "${openSetting}" in the notification, or search Settings for @id:slang.path.`
+      )
+      const response = await vscode.window.showWarningMessage(promptMessage, openSetting)
+      if (response === openSetting) {
+        await vscode.commands.executeCommand('workbench.action.openSettings', '@id:slang.path')
+      }
+      return
+    }
+
+    const install = this.path.managedInstall ? 'Update Managed Server' : 'Switch to Managed Install'
+    const promptMessage = this.path.managedInstall
+      ? `${message} Please update your managed server installation.`
+      : `${message} Please update your server installation, or switch to a managed install.`
+    this.logger.warn(
+      `${promptMessage} Select "${install}" in the notification, or restart the language server to show it again.`
+    )
+    const response = await vscode.window.showWarningMessage(promptMessage, install)
+    if (response !== install) {
+      return
+    }
+
+    const binaryPath = await this.path.installManaged(this.context, this.logger)
+    if (binaryPath !== undefined) {
+      await this.restartLanguageServer.func()
+    }
+  }
+
   private async checkForUpdates(installedVersion: string | null): Promise<void> {
     const updated = await this.path.maybeInstallUpdate(this.context, this.logger, installedVersion)
     if (!updated) {
@@ -345,10 +375,11 @@ File input is sent to stdin, and formatted output is read from stdout.',
     }
 
     const restart = 'Restart Now'
-    const resp = await vscode.window.showInformationMessage(
-      'slang-server has been updated. Restart the language server to use the new version.',
-      restart
+    const message = 'slang-server has been updated. Restart the language server to use it.'
+    this.logger.info(
+      `${message} Select "${restart}" in the notification, or run "slang: Restart Language Server".`
     )
+    const resp = await vscode.window.showInformationMessage(message, restart)
     if (resp === restart) {
       await this.restartLanguageServer.func()
     }
@@ -360,6 +391,8 @@ File input is sent to stdin, and formatted output is read from stdout.',
     },
     async () => {
       this.isRestarting = true
+      this.logger.info('Restarting language server by explicit request')
+      this.client?.info('Restarting language server by explicit request')
       try {
         await this.stopServer()
         await this.setupLanguageClient()
@@ -377,14 +410,14 @@ File input is sent to stdin, and formatted output is read from stdout.',
       title: 'Show Output',
     },
     async () => {
-      if (this.client !== undefined) {
-        this.client.outputChannel.show()
-      }
+      this.serverOutputChannel.show()
     }
   )
 
   async stopServer() {
     if (this.client !== undefined) {
+      this.logger.info('Stopping language server')
+      this.client.info('Stopping language server')
       try {
         await this.client.stop()
       } catch (e) {
@@ -399,20 +432,11 @@ File input is sent to stdin, and formatted output is read from stdout.',
   constructor(context: vscode.ExtensionContext, obj: ViewContainerSpec) {
     super(obj)
     this.context = context
+    this.serverOutputChannel = vscode.window.createOutputChannel('slang-server')
+    context.subscriptions.push(this.serverOutputChannel)
   }
 
   async activate(context: vscode.ExtensionContext) {
-    context.subscriptions.push(
-      this.onConfigUpdated(async () => {
-        this.isRestarting = true
-        try {
-          await this.stopServer()
-          await this.setupLanguageClient()
-        } finally {
-          this.isRestarting = false
-        }
-      })
-    )
     await this.setupLanguageClient()
 
     if (context.storageUri !== undefined) {
@@ -425,9 +449,11 @@ File input is sent to stdin, and formatted output is read from stdout.',
     // Configure Format on save
     /////////////////////////////////////////////
 
-    this.onConfigUpdated(() => {
-      void this.checkFormatDirs()
-    })
+    context.subscriptions.push(
+      this.onConfigUpdated(() => {
+        void this.checkFormatDirs()
+      })
+    )
     await this.checkFormatDirs()
 
     this.logger.info(`${context.extension.id} activation finished.`)

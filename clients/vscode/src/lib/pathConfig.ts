@@ -2,6 +2,7 @@ import * as fs from 'fs'
 import * as fsPromises from 'fs/promises'
 import * as path from 'path'
 import * as process from 'process'
+import { inspect } from 'util'
 import * as vscode from 'vscode'
 import which from 'which'
 import { ConfigObject, ExtensionComponent } from './libconfig'
@@ -9,6 +10,7 @@ import { Logger, StubLogger } from './logger'
 import { PlatformMap, getPlatform } from './platform'
 import { IConfigurationPropertySchema } from './vscodeConfigs'
 import {
+  chooseInstalledBinary,
   installFromGithub,
   latestRelease,
   GithubInstallerConfig,
@@ -54,18 +56,16 @@ export class PathConfigObject extends ConfigObject<string> {
     return toolpath
   }
 
+  hasConfiguredPath(): boolean {
+    return vscode.workspace.getConfiguration().get(this.configPath!, '') !== ''
+  }
+
   async findToolPath(): Promise<string> {
     // get configured path from settings.json
     let toolpath = vscode.workspace.getConfiguration().get(this.configPath!, '')
 
     // path has not been configured in settings.json
     if (toolpath === '') {
-      // start by checking to see if we have a cached value
-      if (path.isAbsolute(this.cachedValue)) {
-        return this.cachedValue
-      }
-
-      // if we don't have a cached value, then we check to see if its on the path
       toolpath = this.platformDefaults[getPlatform()]
       const whichResult = await which(toolpath, { nothrow: true })
       if (whichResult !== '' && whichResult !== null) {
@@ -122,9 +122,10 @@ export class PathConfigObject extends ConfigObject<string> {
   /**
    * Resolve the tool path by checking (in order):
    * 1. Environment variable for debugging (if configured)
-   * 2. User settings / cached value / PATH
+   * 2. User settings
    * 3. Previously installed binary in extension storage
-   * 4. GitHub release installer (if configured)
+   * 4. PATH
+   * 5. GitHub release installer (if configured)
    */
   async resolveToolPath(
     context: vscode.ExtensionContext,
@@ -133,6 +134,7 @@ export class PathConfigObject extends ConfigObject<string> {
     const log = logger ?? new StubLogger()
     const config = this.options.installer
     const toolName = this.platformDefaults[getPlatform()]
+    this.managedInstall = false
 
     // 1. Check environment variable if configured
     if (this.options.envVar) {
@@ -145,9 +147,9 @@ export class PathConfigObject extends ConfigObject<string> {
 
     log.info(`Finding ${toolName}...`)
 
-    // 2. Check configured path / cached value / PATH
-    const configuredPath = await this.findToolPath()
-    if (configuredPath !== '') {
+    // 2. An explicit setting always takes precedence.
+    if (this.hasConfiguredPath()) {
+      const configuredPath = await this.findToolPath()
       log.info(`Using ${toolName} at ${configuredPath}`)
       return configuredPath
     }
@@ -168,39 +170,78 @@ export class PathConfigObject extends ConfigObject<string> {
         return existingBinary
       }
 
-      // 4. Prompt user to install from GitHub
-      try {
-        const shouldInstall = await this.promptInstall(config.githubRepo)
-        if (!shouldInstall) {
-          await vscode.window.showErrorMessage(`${toolName} is required but was not installed.`)
-          return undefined
-        }
+      // 4. Check PATH after managed installations. Once a user opts into a
+      // managed install it should remain selected on subsequent launches.
+      const pathBinary = await this.findToolPath()
+      if (pathBinary !== '') {
+        log.info(`Using ${toolName} at ${pathBinary}`)
+        return pathBinary
+      }
 
-        const binaryPath = await vscode.window.withProgress(
-          {
-            location: vscode.ProgressLocation.Notification,
-            title: `Installing ${toolName}...`,
-            cancellable: false,
-          },
-          async () => {
-            return installFromGithub(storagePath, config, this.platformDefaults)
-          }
-        )
-
-        vscode.window.showInformationMessage(`Installed ${toolName} at ${binaryPath}`)
-        this.cachedValue = binaryPath
-        this.managedInstall = true
-        log.info(`Installed ${toolName} at ${binaryPath}`)
-        return binaryPath
-      } catch (err: any) {
-        await vscode.window.showErrorMessage(
-          `Failed to install ${toolName}: ${err?.message ?? err}`
-        )
+      // 5. Prompt user to install from GitHub
+      const shouldInstall = await this.promptInstall(config.githubRepo, log)
+      if (!shouldInstall) {
+        const message = `${toolName} is required but was not installed.`
+        log.error(message)
+        await vscode.window.showErrorMessage(message)
         return undefined
       }
+      return this.installManaged(context, log)
     }
 
+    // No installer is configured, so PATH is the final option.
+    const pathBinary = await this.findToolPath()
+    if (pathBinary !== '') {
+      log.info(`Using ${toolName} at ${pathBinary}`)
+      return pathBinary
+    }
     return undefined
+  }
+
+  async installManaged(
+    context: vscode.ExtensionContext,
+    logger?: Logger
+  ): Promise<string | undefined> {
+    const log = logger ?? new StubLogger()
+    const config = this.options.installer
+    if (!config) {
+      return undefined
+    }
+
+    const toolName = this.platformDefaults[getPlatform()]
+    const storagePath = context.globalStorageUri.fsPath
+    try {
+      const binaryPath = await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: `Installing ${toolName}...`,
+          cancellable: false,
+        },
+        async () => installFromGithub(storagePath, config, this.platformDefaults, log)
+      )
+
+      vscode.window.showInformationMessage(`Installed ${toolName} at ${binaryPath}`)
+      this.cachedValue = binaryPath
+      this.managedInstall = true
+      log.info(`Installed ${toolName} at ${binaryPath}`)
+      return binaryPath
+    } catch (err: any) {
+      const message = `Failed to install ${toolName}: ${err?.message ?? err}`
+      log.error(`${message}\n${inspect(err)}`)
+      const action = await vscode.window.showErrorMessage(
+        `${message}. See the slang output log for details.`,
+        'Show Logs',
+        'Open Releases'
+      )
+      if (action === 'Show Logs') {
+        log.show()
+      } else if (action === 'Open Releases') {
+        await vscode.env.openExternal(
+          vscode.Uri.parse(`https://github.com/${config.githubRepo}/releases`)
+        )
+      }
+      return undefined
+    }
   }
 
   private async findExistingBinary(root: string): Promise<string | null> {
@@ -211,24 +252,24 @@ export class PathConfigObject extends ConfigObject<string> {
 
     try {
       const entries = await fsPromises.readdir(root, { recursive: true })
-      for (const e of entries) {
-        if (e.endsWith(binaryName)) {
-          return path.join(root, e)
-        }
-      }
+      const binary = chooseInstalledBinary(entries, binaryName)
+      return binary === undefined ? null : path.join(root, binary)
     } catch {
       // Directory doesn't exist yet
     }
     return null
   }
 
-  private async promptInstall(githubRepo: string): Promise<boolean> {
+  private async promptInstall(githubRepo: string, logger: Logger): Promise<boolean> {
     const binaryName = this.platformDefaults[getPlatform()]
     const msg =
       `${binaryName} is required but was not found.\n` +
       `Would you like to install it from [${githubRepo}](https://github.com/${githubRepo}/releases)?`
 
     const install = `Install ${binaryName}`
+    logger.warn(
+      `${msg.replace('\n', ' ')} Select "${install}" in the notification, or restart the language server to show it again.`
+    )
     const resp = await vscode.window.showInformationMessage(msg, install)
     return resp === install
   }
@@ -252,10 +293,8 @@ export class PathConfigObject extends ConfigObject<string> {
     }
 
     const toolName = this.platformDefaults[getPlatform()]
-    const storagePath = context.globalStorageUri.fsPath
-
     try {
-      const release = await latestRelease(config)
+      const release = await latestRelease(config, logger)
       const needsUpdate =
         installedVersion === null || isUpdateAvailable(release.tag_name, installedVersion)
 
@@ -267,6 +306,12 @@ export class PathConfigObject extends ConfigObject<string> {
       const binaryName = this.platformDefaults[getPlatform()]
 
       const update = `Update ${binaryName}`
+      const message =
+        `A newer version of ${binaryName} is available. ` +
+        `Installed: ${installedVersion ?? 'unknown'}. Latest: ${release.tag_name}.`
+      logger.info(
+        `${message} Select "${update}" in the notification, or restart the language server to show it again.`
+      )
       const resp = await vscode.window.showInformationMessage(
         `A newer version of ${binaryName} is available.\n\n` +
           `Installed: ${installedVersion ?? 'unknown'}\n` +
@@ -278,24 +323,16 @@ export class PathConfigObject extends ConfigObject<string> {
         return false
       }
 
-      const newBinaryPath = await vscode.window.withProgress(
-        {
-          location: vscode.ProgressLocation.Notification,
-          title: `Updating ${toolName}...`,
-          cancellable: false,
-        },
-        async () => {
-          return installFromGithub(storagePath, config, this.platformDefaults)
-        }
-      )
-
-      this.cachedValue = newBinaryPath
+      const newBinaryPath = await this.installManaged(context, logger)
+      if (newBinaryPath === undefined) {
+        return false
+      }
       logger.info(`Updated ${toolName} to ${release.tag_name} at ${newBinaryPath}`)
 
       return true
     } catch (err: any) {
       // Silently ignore update check failures (e.g., offline)
-      logger.warn(`Background update check failed: ${err?.message ?? err}`)
+      logger.warn(`Background update check failed: ${inspect(err)}`)
       return false
     }
   }

@@ -15,6 +15,7 @@
 #include "util/Converters.h"
 #include "util/Logging.h"
 #include "util/SlangExtensions.h"
+#include <filesystem>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 #include <stdexcept>
@@ -30,6 +31,7 @@
 #include "slang/syntax/SyntaxTree.h"
 #include "slang/text/SourceLocation.h"
 #include "slang/text/SourceManager.h"
+#include "slang/util/String.h"
 namespace server {
 
 using namespace slang;
@@ -71,7 +73,9 @@ std::shared_ptr<SlangDoc> SlangDoc::fromText(ServerDriver& driver, const URI& ur
         buffer = driver.sm.replaceBuffer(existingBuffer.id, std::move(newBuffer));
     }
     else {
-        buffer = driver.sm.assignText(path, text);
+        // assignText preserves its path verbatim; use the same cache key as readSource
+        // so dependency invalidation cannot replace editor text with disk contents.
+        buffer = driver.sm.assignText(getU8Str(std::filesystem::weakly_canonical(path)), text);
     }
 
     return std::make_shared<SlangDoc>(driver, uri, buffer);
@@ -163,6 +167,9 @@ void SlangDoc::onChange(const std::vector<lsp::TextDocumentContentChangeEvent>& 
         return;
     }
 
+    // LSP Position.character is UTF-16 code units unless the client negotiated utf-8
+    bool utf8Cols = m_driver.client.capabilities.utf8Positions;
+
     auto getOffsets = [&](lsp::Range range) {
         // Only one thread is able to call onchange, so the offsets remain valid without locking
         SourceManager::computeLineOffsets(textView, lineOffsets);
@@ -172,8 +179,19 @@ void SlangDoc::onChange(const std::vector<lsp::TextDocumentContentChangeEvent>& 
             throw std::runtime_error(fmt::format("Range out of bounds: {},{} / {}", start.line,
                                                  end.line, lineOffsets.size()));
         }
-        auto startOffset = lineOffsets[start.line] + start.character;
-        auto endOffset = lineOffsets[end.line] + end.character;
+        auto colToOffset = [&](lsp::uint line, lsp::uint character) -> size_t {
+            size_t lineStart = lineOffsets[line];
+            if (utf8Cols)
+                return lineStart + character;
+            return lineStart + utf16ColumnToByte(textView.substr(lineStart), character);
+        };
+        auto startOffset = colToOffset(start.line, start.character);
+        auto endOffset = colToOffset(end.line, end.character);
+        if (startOffset > endOffset || endOffset >= textView.size()) {
+            throw std::runtime_error(fmt::format("Range out of bounds: {}:{}-{}:{} / {} bytes",
+                                                 start.line, start.character, end.line,
+                                                 end.character, textView.size()));
+        }
         return std::make_pair(startOffset, endOffset);
     };
 
